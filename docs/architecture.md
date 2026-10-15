@@ -53,17 +53,24 @@ short freeze followed by a clean IDR, never growing delay or smeared P-frames.
 
 ## PC
 
-Python 3.14 (Ubuntu 26.04), PySide6 (system package), PyAV, numpy, pyvirtualcam / direct V4L2.
+Python 3.14 (Ubuntu 26.04), PySide6 (system package), PyAV, numpy. Output uses direct V4L2 writes (`ioctl(VIDIOC_S_FMT)` + `write()`), without pyvirtualcam.
 
 | Thread    | Work | Hand-off |
 |-----------|------|----------|
 | `supervisor` | Runs `adb forward` and connects (control first, HELLO, then video). For the life of the session it does blocking reads on the video socket (3 s timeout). On any error it tears down and reconnects with backoff. | Bounded queue (8) → `decode`. A full queue applies backpressure, so the phone's drop queue takes over |
 | `decode`  | PyAV `CodecContext` H.264. Waits for a keyframe after CONFIG or an error. Software decode for now; VAAPI comes in phase 5 (PyAV's bundled FFmpeg has no VAAPI). `flags=LOW_DELAY`, `thread_type=SLICE` (no frame threading, which adds a frame of delay per thread). | Writes into the **latest-frame slot** |
-| `output`  | Waits on the slot, converts to the v4l2 pixel format, writes to `/dev/video10` at the fixed output size. Without input for a while it repeats the last frame, or shows a "PhoneCam disconnected" placeholder. | — |
+| `v4l2-output` | Waits on its slot (100 ms timeout). Converts with swscale to the fixed output size and format (I420 by default, YUYV optional; letterboxed if the aspect differs), then `write()`s to `/dev/video10` immediately. For gaps under 1.5 s it repeats the last frame; after that it writes a "PhoneCam disconnected" card at 10 fps, so the device stays open and listed (`exclusive_caps=1`). Measures capture→written latency. | — |
 | `control` | Control socket: CONTROL_REQ/RES, STATE, STATS, PING every 500 ms, clock offset (min-RTT over a 20-sample window). No PONG for 3 s ends the session. Reports stats. | Listener → Qt signals → GUI |
 | `preview` | Reads its own latest-frame slot, at most 30 fps: swscale to ≤960 px wide RGB, `QImage`, then a queued signal to the GUI. | — |
 | `adb-monitor` | Polls `adb devices -l` every 1.5 s and updates the device list (unplug/replug). | Qt signal |
 | GUI (main)| Qt widgets only. Never blocks: connect, disconnect and adb calls run on short-lived background threads. Stats arrive at 2 Hz. | — |
+
+### Pixel format
+
+Both I420 (YU12) and YUYV were tested in Chrome 154, Firefox 157 (snap) and OBS 32. All three
+list "PhoneCam" and receive 1280×720 at 30 fps in either format. I420 is the default because
+H.264 decodes to 4:2:0: packing takes about 2 ms per 720p frame, against about 6.5 ms for YUYV
+(which needs chroma upsampling). YUYV stays available as a compatibility fallback.
 
 ### Latest-frame slot
 

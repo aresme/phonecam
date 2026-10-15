@@ -22,4 +22,4 @@ Per-stage timings (encode, network, decode, output) are logged at debug level (`
 
 | Date | Phone | Transport | Resolution | FPS | Bitrate | Decoder | Computed (ms) | Glass-to-glass (ms) | Notes |
 |------|-------|-----------|------------|-----|---------|---------|---------------|---------------------|-------|
-| —    | Infinix X6886 (MT6789) | USB | 1280×720 | 30 | 6 Mbit/s | — | — | — | measured in phase 5 |
+| 2026-10-15 | Infinix X6886 (MT6789) | USB | 1280×720 | 30 | 6 Mbit/s | software | 108 (capture→v4l2; phone pipeline ≈ 90–100) | — | phase 3 baseline, before tuning |

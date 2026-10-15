@@ -8,8 +8,8 @@ OBS, Firefox and Chrome can use.
 No third-party streaming libraries are used. The wire protocol is our own: see
 [docs/protocol.md](docs/protocol.md).
 
-> **Status:** Phase 2. Live video from the phone to the PC app over USB, with auto-reconnect.
-> The virtual webcam arrives in phase 3.
+> **Status:** Phase 3. The phone appears as the **PhoneCam** webcam (`/dev/video10`) in Chrome,
+> Firefox, Meet and OBS, with auto-reconnect and a placeholder image while disconnected.
 
 > **Security:** the stream is unencrypted and unauthenticated. Use it over USB or on a trusted
 > LAN only.
@@ -52,12 +52,26 @@ adb install -r app/build/outputs/apk/debug/PhoneCam-0.1.0-debug.apk
 scripts/dev-run.sh
 ```
 
+## One-time setup: the virtual camera
+
+PhoneCam writes into a v4l2loopback device. Either let the PC app's first-run dialog set it up
+(it asks for your password via the normal GNOME prompt), or run:
+
+```bash
+scripts/setup-v4l2loopback.sh --persist   # installs v4l2loopback-dkms if needed, loads it, loads at boot
+```
+
+This creates `/dev/video10` with the label `PhoneCam` and `exclusive_caps=1` (required by Chrome).
+
 ## Daily use (USB)
 
 1. Plug in the phone (USB debugging on) and start the PC app: `pc/.venv/bin/phonecam`.
 2. Press **Launch app on phone** (or open PhoneCam on the phone and tap **Start**).
 3. Pick the device and press **Connect**. If the cable is unplugged, the phone app restarts, or
    the phone is not streaming yet, the PC keeps retrying and reconnects on its own.
+4. In Meet/Zoom/OBS/the browser, pick the camera **PhoneCam**. The virtual camera is on by
+   default and shows a "PhoneCam disconnected" card while the phone isn't connected, so apps
+   keep the device. Output size and format (I420 default, YUYV fallback) are in the right panel.
 
 Developing without a phone: `python -m phonecam.tools.fake_phone some.h264` serves a recording
 on 127.0.0.1. Connect to it with Wi-Fi mode and IP `127.0.0.1`.
@@ -91,5 +105,22 @@ Debug logging on the phone: `adb shell setprop log.tag.PhoneCam VERBOSE`, then
   doesn't appear, run `adb kill-server`, replug, and in Developer options use "Revoke USB debugging
   authorizations".
 
-More troubleshooting (v4l2loopback/`exclusive_caps`, Secure Boot + DKMS, firewall/nftables)
-comes with the phases that need it.
+- **PhoneCam doesn't show up in Chrome/Meet.** The module must be loaded with
+  `exclusive_caps=1`. Check with `cat /sys/module/v4l2loopback/parameters/exclusive_caps`. With
+  that option, the device is only offered as a camera while the PhoneCam app is writing to it, so
+  keep the PC app running with **Virtual camera: ON**. If an app still doesn't list it, try
+  format **YUYV**.
+- **`modprobe: ERROR: could not insert 'v4l2loopback': Key was rejected by service`.** Secure
+  Boot is on and the DKMS-built module isn't signed with an enrolled key. Run
+  `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der`, reboot, choose *Enroll MOK* in the
+  blue MOK manager and enter the one-time password. Alternatively, disable Secure Boot.
+- **"Device busy" when switching the virtual camera on.** Another program (e.g. OBS Virtual
+  Camera) is writing to the loopback device, or a reader is holding a different format. Close it
+  and try again.
+- **`/dev/video10` permission denied.** Your desktop session normally gets access automatically;
+  otherwise run `sudo usermod -aG video $USER` and log in again.
+- **OBS (or another Qt app) crashes on start with the `antialiasing` GLib error.** This is the
+  same GNOME/Qt bug: start it with `QT_QPA_PLATFORMTHEME=gnome obs`, or add
+  `QT_QPA_PLATFORMTHEME=gnome` to `~/.config/environment.d/qt.conf` and log in again.
+
+More troubleshooting (Wi-Fi, firewall/nftables) comes with the phases that need it.

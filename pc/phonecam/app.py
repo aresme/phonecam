@@ -1,4 +1,4 @@
-"""Main window: connection panel, live preview, (phase 4) camera controls, stats bar."""
+"""Main window: connection panel, live preview, camera controls, virtual camera, stats bar."""
 
 from __future__ import annotations
 
@@ -7,14 +7,14 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QCloseEvent
+import numpy as np
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QComboBox,
     QFormLayout,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -31,7 +31,10 @@ from PySide6.QtWidgets import (
 from phonecam import __version__
 from phonecam.adb import Adb, AdbDevice, AdbError, find_adb
 from phonecam.client import Stats, StreamClient, Target
+from phonecam.output import VirtualCamera
 from phonecam.preview import PreviewWidget, PreviewWorker
+from phonecam.setup_dialog import SetupDialog
+from phonecam.v4l2 import PIXEL_FORMATS, find_loopback
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +54,39 @@ QLineEdit, QComboBox {
 }
 QStatusBar { background: #111316; color: #9aa4b2; }
 QLabel#muted { color: #9aa4b2; }
+QPushButton#vcamOn { background: #2e7d32; border-color: #2e7d32; color: white; font-weight: 600; }
 """
+
+OUTPUT_SIZES = [(1280, 720), (1920, 1080), (960, 540), (640, 360)]
+
+
+def render_placeholder(width: int, height: int, message: str) -> np.ndarray:
+    """Placeholder frame for the virtual camera (called on the output thread; QPainter on a
+    QImage is safe off the GUI thread)."""
+    img = QImage(width, height, QImage.Format.Format_RGB888)
+    img.fill(QColor("#16181c"))
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(QColor("#2f6fed"))
+    p.setBrush(QColor("#2f6fed"))
+    r = height // 10
+    p.drawEllipse(width // 2 - r, height // 2 - int(r * 2.2), 2 * r, 2 * r)
+    title = QFont()
+    title.setPixelSize(max(12, height // 12))
+    title.setBold(True)
+    p.setFont(title)
+    p.setPen(QColor("#e6e6e6"))
+    p.drawText(0, height // 2, width, height // 8, Qt.AlignmentFlag.AlignCenter, "PhoneCam")
+    sub_font = QFont()
+    sub_font.setPixelSize(max(10, height // 24))
+    p.setFont(sub_font)
+    p.setPen(QColor("#9aa4b2"))
+    p.drawText(
+        0, height // 2 + height // 8, width, height // 10, Qt.AlignmentFlag.AlignCenter, message
+    )
+    p.end()
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(height, img.bytesPerLine())
+    return arr[:, : width * 3].reshape(height, width, 3).copy()
 
 
 def run_bg(fn: Callable[[], Any], name: str = "bg") -> None:
@@ -123,6 +158,8 @@ class MainWindow(QMainWindow):
         self.bridge = Bridge()
         self.client = StreamClient(self.bridge, self.adb)
         self.preview_worker = PreviewWorker(self.client.preview_slot)
+        self.vcam = VirtualCamera(self.client.output_slot, self.client.clock, render_placeholder)
+        self.settings = QSettings("PhoneCam", "PhoneCam")
         self._connected = False
         self._active = False  # user wants a connection (connect pressed, not disconnected)
 
@@ -136,7 +173,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self.stats_label = QLabel(self._format_stats(None))
+        self.vcam_label = QLabel("")
         self.statusBar().addPermanentWidget(self.stats_label)
+        self.statusBar().addPermanentWidget(self.vcam_label)
+        self.vcam_timer = QTimer(self, interval=500, timeout=self._poll_vcam)
+        self.vcam_timer.start()
         self.statusBar().showMessage("Disconnected")
 
         self.bridge.status.connect(self._on_status)
@@ -158,6 +199,8 @@ class MainWindow(QMainWindow):
             )
             self.wifi_radio.setChecked(True)
             self.usb_radio.setEnabled(False)
+        self._restore_settings()
+        QTimer.singleShot(0, self._init_vcam)
 
     # ------------------------------------------------------------------ layout
 
@@ -199,8 +242,12 @@ class MainWindow(QMainWindow):
         return box
 
     def _controls_panel(self) -> QWidget:
-        box = QGroupBox("Camera")
-        form = QFormLayout(box)
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        cam = QGroupBox("Camera")
+        form = QFormLayout(cam)
         form.addRow(QPushButton("Switch camera"))
         form.addRow("Resolution", QComboBox())
         form.addRow("FPS", QComboBox())
@@ -208,14 +255,132 @@ class MainWindow(QMainWindow):
         form.addRow(QPushButton("Torch"))
         form.addRow("Focus", QComboBox())
         form.addRow("Exposure", QSlider(Qt.Orientation.Horizontal))
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        form.addRow(line)
-        form.addRow(QPushButton("Virtual camera: OFF"))
-        form.addRow(QLabel("/dev/video— not found"))
-        for w in box.findChildren(QWidget):
-            w.setEnabled(False)  # camera controls arrive in phase 4, virtual camera in phase 3
-        return box
+        for w in cam.findChildren(QWidget):
+            w.setEnabled(False)  # camera controls arrive in phase 4
+        lay.addWidget(cam)
+
+        vc = QGroupBox("Virtual camera")
+        vform = QFormLayout(vc)
+        self.vcam_btn = QPushButton("Virtual camera: OFF")
+        self.vcam_btn.setCheckable(True)
+        self.vcam_btn.toggled.connect(self._on_vcam_toggled)
+        # Only a user click changes the saved preference (not errors or shutdown).
+        self.vcam_btn.clicked.connect(lambda on: self.settings.setValue("vcam/on", on))
+        vform.addRow(self.vcam_btn)
+        self.vcam_device = QLabel("Looking for the PhoneCam device…", objectName="muted")
+        self.vcam_device.setWordWrap(True)
+        vform.addRow(self.vcam_device)
+        self.vcam_size = QComboBox()
+        for w, h in OUTPUT_SIZES:
+            self.vcam_size.addItem(f"{w}×{h}", (w, h))
+        vform.addRow("Output", self.vcam_size)
+        self.vcam_format = QComboBox()
+        for key, fmt in PIXEL_FORMATS.items():
+            self.vcam_format.addItem(fmt.name, key)
+        self.vcam_format.setToolTip("I420 is cheaper to produce; YUYV is the most widely supported")
+        vform.addRow("Format", self.vcam_format)
+        self.vcam_setup_btn = QPushButton("Set up virtual camera…")
+        self.vcam_setup_btn.clicked.connect(self._run_setup)
+        self.vcam_setup_btn.setVisible(False)
+        vform.addRow(self.vcam_setup_btn)
+        hint = QLabel(
+            "Output size and format apply when the virtual camera is switched on. "
+            "Apps using it must reopen the camera after a change.",
+            objectName="muted",
+        )
+        hint.setWordWrap(True)
+        vform.addRow(hint)
+        lay.addWidget(vc)
+        lay.addStretch(1)
+        return panel
+
+    # ------------------------------------------------------------------ virtual camera
+
+    def _init_vcam(self) -> None:
+        device = find_loopback()
+        if device is None:
+            self.vcam_device.setText("No PhoneCam device (v4l2loopback not set up).")
+            self.vcam_setup_btn.setVisible(True)
+            self.vcam_btn.setEnabled(False)
+            if not self.settings.value("vcam/setup_declined", False, bool):
+                self._run_setup()
+            return
+        self.vcam_setup_btn.setVisible(False)
+        self.vcam_btn.setEnabled(True)
+        self.vcam_device.setText(device)
+        if self.settings.value("vcam/on", True, bool):
+            self.vcam_btn.setChecked(True)
+
+    def _run_setup(self) -> None:
+        dlg = SetupDialog(self)
+        if dlg.exec() == SetupDialog.DialogCode.Accepted and dlg.device:
+            self.settings.setValue("vcam/setup_declined", False)
+            self._init_vcam()
+        elif find_loopback() is None:
+            self.settings.setValue("vcam/setup_declined", True)
+        else:
+            self._init_vcam()
+
+    def _on_vcam_toggled(self, on: bool) -> None:
+        if on:
+            device = find_loopback()
+            size = self.vcam_size.currentData()
+            fmt = PIXEL_FORMATS[self.vcam_format.currentData()]
+            try:
+                if device is None:
+                    raise OSError("the PhoneCam device does not exist")
+                self.vcam.message = self._vcam_message()
+                self.vcam.start(device, size[0], size[1], fmt)
+            except OSError as e:
+                self.vcam_device.setText(f"Could not start: {e}")
+                self.vcam_btn.blockSignals(True)
+                self.vcam_btn.setChecked(False)
+                self.vcam_btn.blockSignals(False)
+                return
+            self.vcam_device.setText(f"{device} · {size[0]}×{size[1]} · {fmt.fourcc}")
+        else:
+            self.vcam.stop()
+            self.vcam_label.setText("")
+        self.vcam_btn.setText(f"Virtual camera: {'ON' if on else 'OFF'}")
+        self.vcam_btn.setObjectName("vcamOn" if on else "")
+        self._restyle(self.vcam_btn)
+        self.vcam_size.setEnabled(not on)
+        self.vcam_format.setEnabled(not on)
+        self.settings.setValue("vcam/size", list(self.vcam_size.currentData()))
+        self.settings.setValue("vcam/format", self.vcam_format.currentData())
+
+    def _vcam_message(self) -> str:
+        if self._active:
+            return "Reconnecting to the phone…"
+        return "PhoneCam disconnected"
+
+    def _poll_vcam(self) -> None:
+        if self.vcam_btn.isChecked() and not self.vcam.running:
+            # The output thread died (device removed, write error).
+            self.vcam_btn.setChecked(False)
+            self.vcam_device.setText(f"Stopped: {self.vcam.error or 'unknown error'}")
+            return
+        if not self.vcam.running:
+            return
+        st = self.vcam.stats()
+        lat = f"{st.latency_ms:.0f} ms" if st.latency_ms is not None else "—"
+        self.vcam_label.setText(f"  ·  v4l2 {st.fps:.0f} fps ({st.showing}) · capture→v4l2 {lat}")
+
+    # ------------------------------------------------------------------ settings
+
+    def _restore_settings(self) -> None:
+        st = self.settings
+        if st.value("conn/transport", "usb") == "wifi" or self.adb is None:
+            self.wifi_radio.setChecked(True)
+        self.ip_edit.setText(st.value("conn/ip", "", str))
+        size = st.value("vcam/size", None)
+        if size:
+            idx = self.vcam_size.findData((int(size[0]), int(size[1])))
+            if idx >= 0:
+                self.vcam_size.setCurrentIndex(idx)
+        idx = self.vcam_format.findData(st.value("vcam/format", "I420", str))
+        if idx >= 0:
+            self.vcam_format.setCurrentIndex(idx)
 
     # ------------------------------------------------------------------ actions
 
@@ -247,6 +412,9 @@ class MainWindow(QMainWindow):
                 self.conn_status.setText("No USB device selected.")
                 return
             target = Target("127.0.0.1", serial)
+        self.settings.setValue("conn/transport", "wifi" if self.wifi_radio.isChecked() else "usb")
+        self.settings.setValue("conn/ip", self.ip_edit.text().strip())
+        self.settings.setValue("conn/serial", target.serial or "")
         self._active = True
         self._set_inputs_enabled(False)
         self.connect_btn.setText("Disconnect")
@@ -285,6 +453,9 @@ class MainWindow(QMainWindow):
 
     def _on_status(self, status: str, connected: bool) -> None:
         self._connected = connected
+        if status == "Disconnected":
+            self._active = False
+        self.vcam.message = self._vcam_message()
         self.conn_status.setText(status)
         self.statusBar().showMessage(status)
         if connected:
@@ -330,7 +501,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_devices(self, devices: list[AdbDevice]) -> None:
-        current = self._selected_serial()
+        current = self._selected_serial() or self.settings.value("conn/serial", "", str)
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
         for d in devices:
@@ -345,9 +516,11 @@ class MainWindow(QMainWindow):
         self.conn_status.setText(message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.vcam_timer.stop()
         if self.adb_monitor:
             self.adb_monitor.stop()
         self.preview_worker.stop()
+        self.vcam.stop()
         # Bounded wait so adb forwards get removed; the threads are daemons regardless.
         t = threading.Thread(target=self.client.disconnect, daemon=True)
         t.start()

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phonecam"
+version = "0.1.0"
+description = "Use an Android phone as a low-latency webcam on Ubuntu"
+readme = "../README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+# PySide6 and numpy come from Ubuntu (python3-pyside6.*, python3-numpy) via a
+# --system-site-packages venv; see README. They are listed so pip can install them elsewhere.
+dependencies = [
+    "PySide6>=6.6",
+    "numpy>=1.26",
+    "av>=12",
+    "pyvirtualcam>=0.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+phonecam = "phonecam.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["phonecam*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

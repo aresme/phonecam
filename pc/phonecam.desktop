@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PhoneCam
+GenericName=Phone Webcam
+Comment=Use an Android phone as a low-latency webcam
+Exec=phonecam
+Icon=phonecam
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=webcam;camera;android;phone;v4l2;
+StartupWMClass=phonecam

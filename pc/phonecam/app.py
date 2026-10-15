@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -44,6 +45,7 @@ from phonecam.output import VirtualCamera
 from phonecam.power import PerformanceHold
 from phonecam.preview import PreviewWidget, PreviewWorker
 from phonecam.setup_dialog import SetupDialog
+from phonecam.single_instance import SingleInstance
 from phonecam.v4l2 import PIXEL_FORMATS, find_loopback
 
 log = logging.getLogger(__name__)
@@ -112,6 +114,7 @@ class Bridge(QObject):
     state = Signal(dict)
     stats = Signal(object)
     devices = Signal(list)
+    activate = Signal()
     mic_status = Signal(str)
     phones = Signal(list)
     pairing = Signal(str)
@@ -578,7 +581,11 @@ class MainWindow(QMainWindow):
         text = self.ip_combo.currentText().strip()
         idx = self.ip_combo.findText(text)
         data = self.ip_combo.itemData(idx) if idx >= 0 else None
-        return str(data) if data else text
+        if data:
+            return str(data)
+        # A list label ("📱 Model · 192.168.1.20 · code") restored as plain text: take the IP.
+        m = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
+        return m.group(0) if m and " " in text else text
 
     def _fill_ip_combo(self) -> None:
         text = self.ip_combo.currentText()
@@ -864,7 +871,15 @@ def run(argv: list[str]) -> int:
     app.setApplicationVersion(__version__)
     app.setStyleSheet(STYLE)
     app.setQuitOnLastWindowClosed(False)
+    instance = SingleInstance()
+    activate = Bridge()  # thread-safe signal carrier for the "show window" request
+    if not instance.acquire(activate.activate.emit):
+        log.info("PhoneCam is already running; asked it to show its window")
+        print("PhoneCam is already running.")
+        return 0
     win = MainWindow()
+    activate.activate.connect(win._show_window)
+    app.aboutToQuit.connect(instance.release)
     if win.tray is None:
         app.setQuitOnLastWindowClosed(True)
     win.show()

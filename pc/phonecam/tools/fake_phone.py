@@ -31,6 +31,46 @@ from phonecam.protocol import (
 
 log = logging.getLogger(__name__)
 
+# Capabilities resembling a real phone, so the PC control panel is populated during development.
+FAKE_CAMERAS = [
+    {
+        "id": "0",
+        "facing": "back",
+        "sizes": [[1920, 1080], [1280, 720], [960, 540], [640, 480]],
+        "fps_ranges": [[15, 15], [24, 24], [30, 30]],
+        "has_flash": True,
+        "af_modes": ["off", "auto", "continuous-video", "continuous-picture", "locked"],
+        "exposure_comp": {"min": -20, "max": 20, "step": 0.1},
+    },
+    {
+        "id": "1",
+        "facing": "front",
+        "sizes": [[1920, 1080], [1280, 720]],
+        "fps_ranges": [[30, 30]],
+        "has_flash": False,
+        "af_modes": ["off"],
+        "exposure_comp": {"min": -20, "max": 20, "step": 0.1},
+    },
+]
+FAKE_STATE = {
+    "streaming": True,
+    "camera_id": "0",
+    "facing": "back",
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "bitrate": 6_000_000,
+    "orientation": "landscape",
+    "rotation": 0,
+    "torch": False,
+    "af_mode": "continuous-video",
+    "exposure_comp": 0.0,
+    "encoder": "fake.avc.encoder",
+    "audio": False,
+    "mic": "voice",
+    "audio_permission": True,
+}
+
 # The fake phone's clock runs 1 hour ahead of the PC's, to exercise offset estimation.
 CLOCK_OFFSET_US = 3_600_000_000
 
@@ -204,14 +244,14 @@ class FakePhone:
                                 {
                                     "server": "fake-phone",
                                     "version": 1,
-                                    "device": {"model": "Fake Phone", "android": "0", "sdk": 0},
-                                    "cameras": [],
-                                    "encoders": [],
-                                    "state": {},
+                                    "device": {"model": "Fake Phone", "android": "16", "sdk": 36},
+                                    "cameras": FAKE_CAMERAS,
+                                    "encoders": [{"name": "fake.avc.encoder", "hardware": True}],
+                                    "state": FAKE_STATE,
                                 },
                             ).encode()
                         )
-                        sock.sendall(json_packet(PacketType.STATE, {"streaming": True}).encode())
+                        sock.sendall(json_packet(PacketType.STATE, FAKE_STATE).encode())
                     elif p.type == PacketType.PING:
                         sock.sendall(pong_packet(parse_ping(p), self.phone_now()).encode())
         except OSError:

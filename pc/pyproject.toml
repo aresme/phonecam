@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "phonecam"
 version = "0.1.0"
-description = "Use an Android phone as a low-latency webcam on Ubuntu"
+description = "Turn an Android phone into a low-latency webcam and microphone for Linux (V4L2 + PipeWire)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -17,6 +17,21 @@ dependencies = [
     "av>=12",
     "zeroconf>=0.130",
 ]
+
+keywords = ["webcam", "android", "v4l2loopback", "pipewire", "h264", "virtual-camera"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+
+[project.urls]
+Homepage = "https://github.com/aresme/phonecam"
+Documentation = "https://github.com/aresme/phonecam/tree/main/docs"
+Issues = "https://github.com/aresme/phonecam/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]

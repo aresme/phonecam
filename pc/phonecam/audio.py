@@ -19,6 +19,7 @@ import contextlib
 import fcntl
 import json
 import logging
+import os
 import queue
 import shutil
 import subprocess
@@ -115,23 +116,44 @@ class VirtualMic:
 class PwCatSink:
     """Low-latency playback stream into the virtual source."""
 
-    FEED = "phonecam_mic_feed"
-
     def __init__(self, target: str | None = None) -> None:
         self.target = target or SOURCE_NAME
+        # Unique per process: two PhoneCam instances must never grab each other's feed node.
+        self.FEED = f"phonecam_mic_feed_{os.getpid()}"
         self._proc: subprocess.Popen | None = None
+        self._stuck = 0
+        self.dropped = 0
 
     def write(self, pcm: bytes) -> bool:
+        """Non-blocking: an unlinked or stalled stream stops consuming, and a blocking write
+        would then freeze the audio thread. Drop the frame instead; restart after ~1 s stuck."""
         proc = self._ensure()
         if proc is None or proc.stdin is None:
             return False
+        fd = proc.stdin.fileno()
+        view = memoryview(pcm)
+        deadline = time.monotonic() + 0.02
         try:
-            proc.stdin.write(pcm)
-            proc.stdin.flush()
-            return True
+            while view:
+                try:
+                    n = os.write(fd, view)
+                    view = view[n:]
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.002)
         except (BrokenPipeError, OSError, ValueError):
             self.close()
             return False
+        if view:
+            self.dropped += 1
+            self._stuck += 1
+            if self._stuck > 50:
+                log.warning("PhoneCam Mic feed stalled; restarting it")
+                self.close()
+            return False
+        self._stuck = 0
+        return True
 
     def _ensure(self) -> subprocess.Popen | None:
         if self._proc is not None and self._proc.poll() is None:
@@ -167,6 +189,7 @@ class PwCatSink:
         assert proc.stdin is not None
         with contextlib.suppress(OSError):
             fcntl.fcntl(proc.stdin.fileno(), F_SETPIPE_SZ, 4096)  # ~42 ms: no hidden backlog
+        os.set_blocking(proc.stdin.fileno(), False)
         self._proc = proc
         self._link()
         return proc

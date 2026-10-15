@@ -34,8 +34,11 @@ from phonecam import __version__
 from phonecam.adb import Adb, AdbDevice, AdbError, find_adb
 from phonecam.client import Stats, StreamClient, Target
 from phonecam.controls import ControlsPanel
+from phonecam.decoder import vaapi_available
 from phonecam.desktop import icon_path
+from phonecam.latency_test import LatencyWindow
 from phonecam.output import VirtualCamera
+from phonecam.power import PerformanceHold
 from phonecam.preview import PreviewWidget, PreviewWorker
 from phonecam.setup_dialog import SetupDialog
 from phonecam.v4l2 import PIXEL_FORMATS, find_loopback
@@ -164,6 +167,7 @@ class MainWindow(QMainWindow):
         self.preview_worker = PreviewWorker(self.client.preview_slot)
         self.vcam = VirtualCamera(self.client.output_slot, self.client.clock, render_placeholder)
         self.settings = QSettings("PhoneCam", "PhoneCam")
+        self.power = PerformanceHold()
         self._connected = False
         self._active = False  # user wants a connection (connect pressed, not disconnected)
 
@@ -290,6 +294,30 @@ class MainWindow(QMainWindow):
             self.vcam_format.addItem(fmt.name, key)
         self.vcam_format.setToolTip("I420 is cheaper to produce; YUYV is the most widely supported")
         vform.addRow("Format", self.vcam_format)
+        self.decoder_combo = QComboBox()
+        self.decoder_combo.addItem("Software (lowest latency)", "software")
+        self.decoder_combo.addItem("VAAPI hardware (less CPU)", "vaapi")
+        if not vaapi_available():
+            self.decoder_combo.model().item(1).setEnabled(False)
+            self.decoder_combo.setToolTip(
+                "This PyAV build has no VAAPI: run scripts/build-pyav-vaapi.sh"
+            )
+        self.decoder_combo.currentIndexChanged.connect(self._on_decoder_changed)
+        vform.addRow("Decoder", self.decoder_combo)
+        self.boost = QCheckBox("Boost CPU while streaming")
+        self.boost.setToolTip(
+            "Hold the 'performance' power profile while connected: halves decode time on a laptop "
+            "(more power use on battery)"
+        )
+        self.boost.setChecked(self.settings.value("power/boost", True, bool))
+        self.boost.toggled.connect(self._on_boost_toggled)
+        vform.addRow(self.boost)
+        self.latency_btn = QPushButton("Latency test…")
+        self.latency_btn.setToolTip(
+            "Full-screen timer + automatic flash test; point the phone at the screen"
+        )
+        self.latency_btn.clicked.connect(self._open_latency_test)
+        vform.addRow(self.latency_btn)
         self.vcam_setup_btn = QPushButton("Set up virtual camera…")
         self.vcam_setup_btn.clicked.connect(self._run_setup)
         self.vcam_setup_btn.setVisible(False)
@@ -360,6 +388,30 @@ class MainWindow(QMainWindow):
         self.settings.setValue("vcam/size", self.vcam_size.currentData().split("x"))
         self.settings.setValue("vcam/format", self.vcam_format.currentData())
 
+    def _on_decoder_changed(self, _: int) -> None:
+        mode = self.decoder_combo.currentData()
+        self.client.decoder_mode = mode
+        self.settings.setValue("decoder/mode", mode)
+
+    def _on_boost_toggled(self, on: bool) -> None:
+        self.settings.setValue("power/boost", on)
+        self._update_power()
+
+    def _update_power(self) -> None:
+        want = self.boost.isChecked() and self._active
+        if want and not self.power.held:
+            run_bg(self.power.acquire, "power")
+        elif not want and self.power.held:
+            run_bg(self.power.release, "power")
+
+    def _open_latency_test(self) -> None:
+        device = self.vcam.device
+        if device is None:
+            self.statusBar().showMessage("Switch the virtual camera on first.", 4000)
+            return
+        self._latency_win = LatencyWindow(device)
+        self._latency_win.showFullScreen()
+
     def _vcam_message(self) -> str:
         if self._active:
             return "Reconnecting to the phone…"
@@ -390,6 +442,9 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.vcam_size.setCurrentIndex(idx)
         self.controls.mirror.setChecked(st.value("vcam/mirror", False, bool))
+        idx = self.decoder_combo.findData(st.value("decoder/mode", "software", str))
+        if idx >= 0 and self.decoder_combo.model().item(idx).isEnabled():
+            self.decoder_combo.setCurrentIndex(idx)
         idx = self.vcam_format.findData(st.value("vcam/format", "I420", str))
         if idx >= 0:
             self.vcam_format.setCurrentIndex(idx)
@@ -473,6 +528,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status)
         self.controls.set_connected(connected)
         self._update_tray()
+        self._update_power()
         if connected:
             self.preview.set_message("")
         elif self._active:
@@ -501,6 +557,23 @@ class MainWindow(QMainWindow):
 
     def _on_stats(self, s: Stats) -> None:
         self.stats_label.setText(self._format_stats(s))
+        ph = s.phone
+
+        def ms(v: object) -> str:
+            return f"{v:.1f} ms" if isinstance(v, int | float) else "—"
+
+        self.stats_label.setToolTip(
+            "Per-stage latency (averages over the last 0.5 s):\n"
+            f"  phone: sensor → capture result   {ms(ph.get('capture_ms'))} "
+            f"(exposure {ms(ph.get('exposure_ms'))}, "
+            f"pipeline depth {ph.get('pipeline_depth', '—')})\n"
+            f"  phone: → encoded                 {ms(ph.get('pipeline_ms'))} "
+            f"(encode ≈ {ms(ph.get('encode_ms'))})\n"
+            f"  PC: capture → received           {ms(s.received_ms)}\n"
+            f"  PC: decode                       {ms(s.decode_ms)}\n"
+            f"  PC: capture → decoded            {ms(s.latency_ms)}\n"
+            "  PC: capture → written to v4l2    see the v4l2 field"
+        )
 
     @staticmethod
     def _format_stats(s: Stats | None) -> str:
@@ -627,6 +700,7 @@ class MainWindow(QMainWindow):
         if self.tray is not None:
             self.tray.hide()
         self.vcam_timer.stop()
+        self.power.release()
         if self.adb_monitor:
             self.adb_monitor.stop()
         self.preview_worker.stop()

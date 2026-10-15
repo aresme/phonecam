@@ -8,7 +8,8 @@ OBS, Firefox and Chrome can use.
 No third-party streaming libraries are used. The wire protocol is our own: see
 [docs/protocol.md](docs/protocol.md).
 
-> **Status:** Phase 4. PhoneCam webcam (`/dev/video10`) with full remote control from the PC
+> **Status:** Phase 5 (latency pass done: ~110 ms capture → webcam over USB, see
+> [docs/latency.md](docs/latency.md)). Previously: Phase 4. PhoneCam webcam (`/dev/video10`) with full remote control from the PC
 > (camera, resolution, fps, bitrate, torch, focus, exposure, orientation), kept in sync with the
 > phone's own controls. Tray icon and app-grid entry.
 
@@ -97,6 +98,18 @@ Everything can be changed from either side, and both UIs stay in sync:
   pillarboxed.
 - Settings are remembered on both sides (phone: DataStore, PC: `~/.config/PhoneCam/PhoneCam.conf`).
   *Connect automatically on launch* reconnects to the last device.
+
+### Latency
+
+- The status bar shows *capture → decoded* and *capture → v4l2*. Hover it for the per-stage
+  breakdown (phone camera, encode, USB, decode).
+- **Latency test…** (virtual camera panel) opens a full-screen test. Point the phone at the
+  screen, press **F** for the automatic flash test or **Space** for timer snapshots
+  (~/Pictures/PhoneCam). Method and results: [docs/latency.md](docs/latency.md).
+- **Boost CPU while streaming** (on by default) holds the *performance* power profile while
+  connected. It cuts decode time roughly in half on a laptop, at the cost of some extra power.
+- **Decoder:** software is fastest. VAAPI hardware decoding uses less CPU and needs PyAV built
+  against Ubuntu's FFmpeg: `scripts/build-pyav-vaapi.sh`.
 
 ### Tray icon
 

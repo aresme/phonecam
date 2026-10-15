@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
+from av.video.reformatter import VideoReformatter
 
 from phonecam.client import DecodedFrame
 from phonecam.clock import ClockSync, now_us
@@ -126,6 +127,7 @@ class VirtualCamera:
         assert writer is not None
         last: bytes | None = None
         last_t = 0.0
+        reformatter = VideoReformatter()  # owned by this thread (see v4l2.pack)
         try:
             while not self._stop.is_set():
                 df = self._slot.get(1 / IDLE_FPS)
@@ -133,7 +135,13 @@ class VirtualCamera:
                 if df is not None:
                     t0 = time.perf_counter()
                     data = pack(
-                        df.frame, self.width, self.height, self.pixfmt, df.rotation, self.mirror
+                        df.frame,
+                        self.width,
+                        self.height,
+                        self.pixfmt,
+                        df.rotation,
+                        self.mirror,
+                        reformatter,
                     )
                     writer.write(data)
                     t_written = now_us()

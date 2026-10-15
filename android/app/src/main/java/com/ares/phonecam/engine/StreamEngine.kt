@@ -85,6 +85,10 @@ data class EngineStats(
     /** Sensor timestamp → encoded frame available (exposure end/readout + ISP + encode). */
     val pipelineMs: Float = 0f,
     val pipelineMaxMs: Float = 0f,
+    /** Sensor timestamp → capture result delivered (exposure + readout + ISP). */
+    val captureMs: Float = 0f,
+    val exposureMs: Float = 0f,
+    val pipelineDepth: Int = 0,
 )
 
 data class EngineState(
@@ -121,9 +125,22 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
             CoroutineExceptionHandler { _, e -> Log.e(TAG, "engine coroutine failed", e) },
     )
     private val mutex = Mutex()
-    private val camera = CameraController(cameraManager, handler) { id, reason ->
-        scope.launch { mutex.withLock { handleFailure(RuntimeException("camera $id $reason")) } }
-    }
+    private val captureSumUs = AtomicLong()
+    private val captureN = AtomicLong()
+    private val exposureSumUs = AtomicLong()
+    @Volatile private var lastDepth = 0
+    private val camera = CameraController(
+        cameraManager, handler,
+        onDeviceLost = { id, reason -> scope.launch { mutex.withLock { handleFailure(RuntimeException("camera $id $reason")) } } },
+        onCaptureMetrics = { latencyNs, exposureNs, depth ->
+            if (_state.value.camera?.timestampRealtime == true) {
+                captureSumUs.addAndGet(latencyNs / 1000)
+                captureN.incrementAndGet()
+            }
+            exposureSumUs.addAndGet(exposureNs / 1000)
+            lastDepth = depth
+        },
+    )
 
     private data class Desired(
         val streaming: Boolean = false,
@@ -131,6 +148,7 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
         val preview: SurfaceTexture? = null,
         val config: StreamConfig? = null,
         val controls: Controls = Controls(),
+        val tuning: Tuning = Tuning(),
         /** Bumped to force a re-apply after a failure. */
         val epoch: Int = 0,
     )
@@ -191,6 +209,15 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
     fun stopStreaming() = desired.update { it.copy(streaming = false, record = false) }
 
     fun requestKeyframe() = encoder?.requestKeyframe()
+
+    /** Experimental latency knobs (see [Tuning]); throws IllegalArgumentException on bad values. */
+    fun setTuning(changes: org.json.JSONObject) {
+        val t = desired.value.tuning.merge(changes)
+        desired.update { it.copy(tuning = t) }
+        Log.i(TAG, "tuning: ${t.toJson()}")
+    }
+
+    val tuning: Tuning get() = desired.value.tuning
 
     // ---- controls: validate synchronously (IllegalArgumentException = rejected), apply async.
 
@@ -417,14 +444,15 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
             return
         }
 
-        val encCfg = EncoderConfig(cfg.width, cfg.height, cfg.fps, cfg.bitrate)
+        val t = d.tuning
+        val encCfg = EncoderConfig(cfg.width, cfg.height, cfg.fps, cfg.bitrate, profile = t.profile, operatingRate = t.operatingRate, vendor = t.vendor)
         val curEnc = encoder
         val encoderChange = d.streaming != (curEnc != null) ||
             (curEnc != null && curEnc.config.copy(bitrate = 0) != encCfg.copy(bitrate = 0))
         val wantPreviewSize = d.preview?.let { choosePreviewSize(info, cfg) }
         val previewChange = d.preview !== previewTexture || wantPreviewSize != previewSize
         val cameraChange = camera.cameraId != null && camera.cameraId != cfg.cameraId
-        val params = captureParams(info, cfg, d.controls, d.streaming)
+        val params = captureParams(info, cfg, d.controls, d.streaming).copy(tuning = d.tuning)
 
         if (encoderChange || previewChange || cameraChange || camera.device == null) {
             camera.closeSession()
@@ -599,6 +627,9 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
         var lastFrames = 0L
         var lastBytes = 0L
         var lastSum = 0L
+        var lastCapSum = 0L
+        var lastCapN = 0L
+        var lastExpSum = 0L
         var lastT = SystemClock.elapsedRealtime()
         while (true) {
             delay(1000)
@@ -614,7 +645,11 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
                 frames = f,
                 pipelineMs = if (df > 0) (s - lastSum) / df / 1000f else 0f,
                 pipelineMaxMs = latencyMaxUs.getAndSet(0) / 1000f,
+                captureMs = (captureN.get() - lastCapN).let { n -> if (n > 0) (captureSumUs.get() - lastCapSum) / n / 1000f else 0f },
+                exposureMs = (captureN.get() - lastCapN).let { n -> if (n > 0) (exposureSumUs.get() - lastExpSum) / n / 1000f else 0f },
+                pipelineDepth = lastDepth,
             )
+            lastCapSum = captureSumUs.get(); lastCapN = captureN.get(); lastExpSum = exposureSumUs.get()
             if (df > 0) Log.d(TAG, "stats $stats")
             _state.update { it.copy(stats = stats) }
             lastFrames = f; lastBytes = b; lastSum = s; lastT = now

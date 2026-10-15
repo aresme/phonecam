@@ -154,6 +154,7 @@ encoder. The PC drops `VIDEO` packets until the first keyframe after a `CONFIG`.
 | `set_orientation`   | `{"orientation": "landscape"\|"portrait"\|"auto"}`. Landscape means the phone is held with its top to the left; auto follows the phone's orientation sensor |
 | `request_keyframe`  | `{}` |
 | `get_status`        | `{}` |
+| `set_tuning`        | *Experimental, for latency measurements.* Any of `{"template": "record"\|"preview", "noise_reduction": "default"\|"off"\|"fast"\|"hq"\|"minimal", "edge": "default"\|"off"\|"fast", "stabilization_off": bool, "profile": "auto"\|"baseline"\|"main"\|"high", "operating_rate": int (-1 = max), "vendor": {"key": int}}`. Encoder-level keys restart the encoder |
 
 ### 0x11 CONTROL_RES
 
@@ -212,12 +213,17 @@ The phone sends `STATS` at 1 Hz while streaming:
 
 ```json
 {
-  "fps": 30.0, "bitrate": 5980000, "dropped": 0, "dropped_total": 3,
-  "encode_ms": 9.4, "queue": 0,
+  "fps": 30.0, "bitrate": 5980000, "frames": 1234, "dropped_total": 3, "queue": 0,
+  "pipeline_ms": 95.6, "pipeline_max_ms": 112.0,
+  "capture_ms": 86.3, "exposure_ms": 30.0, "pipeline_depth": 4, "encode_ms": 9.3,
+  "tuning": { "...": "current set_tuning values" },
   "battery_pct": 81, "battery_temp_c": 33.5, "thermal_status": 0,
   "client": "127.0.0.1"
 }
 ```
+
+`pipeline_ms` = sensor timestamp → encoded frame; `capture_ms` = sensor timestamp → capture
+result; `encode_ms` ≈ their difference (docs/latency.md).
 
 ### 0x40 AUDIO
 

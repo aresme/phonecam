@@ -17,6 +17,7 @@ from pathlib import Path
 
 import av
 import numpy as np
+from av.video.reformatter import VideoReformatter
 
 log = logging.getLogger(__name__)
 
@@ -200,16 +201,22 @@ def pack(
     pixfmt: PixelFormat,
     rotation: int = 0,
     mirror: bool = False,
+    reformatter: VideoReformatter | None = None,
 ) -> bytes:
     """Scale (swscale; letterboxed if the aspect differs), optionally rotate clockwise by
-    `rotation` degrees and mirror horizontally, and pack into contiguous frame bytes."""
+    `rotation` degrees and mirror horizontally, and pack into contiguous frame bytes.
+
+    Pass a `reformatter` owned by the calling thread: `frame.reformat()` uses a swscale context
+    cached on the frame object, and the same decoded frame is converted concurrently by the
+    preview and output threads (sharing one context crashes inside libswscale)."""
+    rf = reformatter or VideoReformatter()
     rotation %= 360
     quarter = rotation in (90, 270)
     src_w, src_h = (frame.height, frame.width) if quarter else (frame.width, frame.height)
     w, h, x, y = fit(src_w, src_h, dst_w, dst_h)  # size/position of the upright picture
 
     if rotation == 0 and not mirror:  # fast path: swscale does everything
-        f = frame.reformat(width=w, height=h, format=pixfmt.av_format)
+        f = rf.reformat(frame, width=w, height=h, format=pixfmt.av_format)
         if pixfmt.fourcc == "YUYV":
             return _paste_yuyv(_plane(f, 0, h, w * 2), dst_w, dst_h, x, y)
         return _paste_i420(
@@ -224,7 +231,7 @@ def pack(
 
     # Scale in the original orientation, then rotate/mirror the I420 planes with numpy.
     pw, ph = (h, w) if quarter else (w, h)
-    f = frame.reformat(width=pw, height=ph, format="yuv420p")
+    f = rf.reformat(frame, width=pw, height=ph, format="yuv420p")
     k = {90: -1, 180: 2, 270: 1}.get(rotation, 0)  # np.rot90: positive k = counter-clockwise
     planes = []
     for plane in (

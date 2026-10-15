@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 
+from av.video.reformatter import VideoReformatter
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPaintEvent, QTransform
 from PySide6.QtWidgets import QSizePolicy, QWidget
@@ -42,6 +43,7 @@ class PreviewWorker(QObject):
 
     def _run(self) -> None:
         next_t = 0.0
+        reformatter = VideoReformatter()  # own swscale context (see v4l2.pack)
         while not self._stop.is_set():
             df = self._slot.get(0.25)
             if df is None or not self.enabled:
@@ -54,7 +56,7 @@ class PreviewWorker(QObject):
             w = min(MAX_PREVIEW_W, f.width)
             h = max(2, round(f.height * w / f.width) // 2 * 2)
             try:
-                rgb = f.reformat(width=w, height=h, format="rgb24").to_ndarray()
+                rgb = reformatter.reformat(f, width=w, height=h, format="rgb24").to_ndarray()
             except Exception:
                 log.exception("preview conversion failed")
                 continue

@@ -193,3 +193,32 @@ def test_rotated_portrait_is_pillarboxed_in_landscape_output() -> None:
     data = pack(marker_frame(1280, 720), 1280, 720, I420, rotation=90)
     y = luma(data, 1280, 720, I420)
     assert y[:, :300].max() == 16 and y[:, -300:].max() == 16  # bars left and right
+
+
+def test_concurrent_pack_of_same_frame_with_own_reformatters() -> None:
+    """Preview and output threads convert the same decoded frame at the same time; each must use
+    its own swscale context (sharing the frame's cached one segfaulted with system FFmpeg)."""
+    import threading
+
+    from av.video.reformatter import VideoReformatter
+
+    frame = rgb_frame(1280, 720)
+    errors: list[BaseException] = []
+
+    def work(fmt, size) -> None:
+        rf = VideoReformatter()
+        try:
+            for _ in range(60):
+                pack(frame, size[0], size[1], fmt, reformatter=rf)
+        except BaseException as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=work, args=(I420, (1280, 720))),
+        threading.Thread(target=work, args=(YUYV, (640, 360))),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors

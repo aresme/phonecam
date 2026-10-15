@@ -225,6 +225,7 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
                 "set_orientation" -> engine.setOrientation(Orientation.fromWire(args.optString("orientation"))
                     ?: throw IllegalArgumentException("orientation must be landscape, portrait or auto"))
                 "request_keyframe" -> engine.requestKeyframe()
+                "set_tuning" -> engine.setTuning(args) // experimental, for latency measurements
                 "get_status" -> Unit
                 else -> throw IllegalArgumentException("unknown command: $cmd")
             }
@@ -283,6 +284,12 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
             .put("bitrate", s.bitrateBps)
             .put("frames", s.frames)
             .put("pipeline_ms", s.pipelineMs.toDouble())
+            .put("pipeline_max_ms", s.pipelineMaxMs.toDouble())
+            .put("capture_ms", s.captureMs.toDouble())
+            .put("exposure_ms", s.exposureMs.toDouble())
+            .put("pipeline_depth", s.pipelineDepth)
+            .put("encode_ms", (s.pipelineMs - s.captureMs).toDouble().coerceAtLeast(0.0))
+            .put("tuning", engine.tuning.toJson())
             .put("dropped_total", v?.dropped ?: 0)
             .put("queue", v?.queueDepth ?: 0)
             .put("battery_pct", battery?.let { it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) * 100 / it.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1) })

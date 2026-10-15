@@ -89,6 +89,21 @@ Python 3.14 (Ubuntu 26.04), PySide6 (system package), PyAV, numpy. Output uses d
 | `adb-monitor` | Polls `adb devices -l` every 1.5 s and updates the device list (unplug/replug). | Qt signal |
 | GUI (main)| Qt widgets only. Never blocks: connect, disconnect and adb calls run on short-lived background threads. Stats arrive at 2 Hz. | — |
 
+### Decoding, CPU boost, swscale contexts
+
+- Software decoding (FFmpeg h264, `low_delay`, slice threads) is the default; it has the lowest
+  latency on this laptop. *VAAPI* is an option (less CPU) when PyAV is built against the system
+  FFmpeg (`scripts/build-pyav-vaapi.sh`). If VAAPI can't be opened, or rejects the stream
+  (plain Baseline), decoding falls back to software automatically. The decoder can be switched
+  live; the switch requests a keyframe.
+- "Boost CPU while streaming" holds the `performance` power profile through power-profiles-daemon
+  (`HoldProfile` over D-Bus via Gio) while connected. Between frames, a laptop in *balanced*
+  otherwise drops clocks, and that doubles decode time. The hold is released on disconnect, on
+  quit, and automatically by the daemon if the process dies.
+- Every thread that converts frames (preview, v4l2 output, latency reader) owns its own
+  `VideoReformatter`. The same decoded `av.VideoFrame` goes to several threads, and
+  `frame.reformat()` would share one swscale context between them (crash in libswscale).
+
 ### Rotation and mirroring (PC)
 
 Rotation comes from VIDEO flag bits 1–2. Unrotated frames use the swscale fast path. Rotated or

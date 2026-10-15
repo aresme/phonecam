@@ -5,6 +5,9 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.os.SystemClock
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
@@ -33,6 +36,7 @@ data class CaptureParams(
     val region: MeteringRectangle? = null,
     val maxAfRegions: Int = 0,
     val maxAeRegions: Int = 0,
+    val tuning: com.ares.phonecam.engine.Tuning = com.ares.phonecam.engine.Tuning(),
 )
 
 /**
@@ -44,7 +48,20 @@ class CameraController(
     private val handler: Handler,
     /** Called (on the camera thread) when an open device is lost or fails. */
     private val onDeviceLost: (cameraId: String, reason: String) -> Unit,
+    /** Per-frame capture metrics: (sensor timestamp -> result ns, exposure ns, pipeline depth). */
+    private val onCaptureMetrics: (resultLatencyNs: Long, exposureNs: Long, depth: Int) -> Unit = { _, _, _ -> },
 ) {
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+            onCaptureMetrics(
+                SystemClock.elapsedRealtimeNanos() - ts,
+                result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
+                result.get(CaptureResult.REQUEST_PIPELINE_DEPTH)?.toInt() ?: 0,
+            )
+        }
+    }
+
     private val executor = Executor { handler.post(it) }
 
     var device: CameraDevice? = null
@@ -125,7 +142,7 @@ class CameraController(
 
     private fun buildRequest(params: CaptureParams, afTrigger: Int): CaptureRequest? {
         val dev = device ?: return null
-        val template = if (params.recording) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+        val template = if (params.recording) params.tuning.templateValue else CameraDevice.TEMPLATE_PREVIEW
         return dev.createCaptureRequest(template).apply {
             sessionSurfaces.forEach { addTarget(it) }
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
@@ -135,6 +152,11 @@ class CameraController(
             set(CaptureRequest.CONTROL_AF_MODE, params.afMode)
             set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
             set(CaptureRequest.FLASH_MODE, if (params.torch) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+            params.tuning.noiseReductionValue?.let { set(CaptureRequest.NOISE_REDUCTION_MODE, it) }
+            params.tuning.edgeValue?.let { set(CaptureRequest.EDGE_MODE, it) }
+            if (params.tuning.stabilizationOff) {
+                set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+            }
             params.region?.let { r ->
                 if (params.maxAfRegions > 0) set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(r))
                 if (params.maxAeRegions > 0) set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(r))
@@ -147,7 +169,7 @@ class CameraController(
         val req = buildRequest(params, CaptureRequest.CONTROL_AF_TRIGGER_IDLE) ?: return
         lastParams = params
         try {
-            s.setRepeatingRequest(req, null, handler)
+            s.setRepeatingRequest(req, captureCallback, handler)
         } catch (e: Exception) {
             Log.w(TAG, "setRepeatingRequest failed", e)
         }

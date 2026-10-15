@@ -22,6 +22,9 @@ data class EncoderConfig(
     val fps: Int,
     val bitrate: Int,
     val iFrameIntervalSec: Int = 1,
+    val profile: String = "auto",
+    val operatingRate: Int = 0,
+    val vendor: Map<String, Int> = emptyMap(),
 )
 
 /**
@@ -170,6 +173,9 @@ class VideoEncoder private constructor(
                         val format = buildFormat(cfg, c.caps, withProfile)
                         enc.startCodec(format)
                         Log.i(TAG, "encoder ${c.name} started: $format")
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            runCatching { Log.i(TAG, "encoder vendor parameters: ${codec.supportedVendorParameters}") }
+                        }
                         return enc
                     } catch (e: Exception) {
                         Log.w(TAG, "encoder ${c.name} (profile=$withProfile) failed to start", e)
@@ -194,10 +200,15 @@ class VideoEncoder private constructor(
                 }
                 if (withProfile) {
                     val profiles = caps.profileLevels.map { it.profile }.toSet()
-                    val profile = when {
-                        Build.VERSION.SDK_INT >= 27 && CodecProfileLevel.AVCProfileConstrainedBaseline in profiles ->
+                    val profile = when (cfg.profile) {
+                        "main" -> CodecProfileLevel.AVCProfileMain
+                        "high" -> CodecProfileLevel.AVCProfileHigh
+                        "baseline" -> CodecProfileLevel.AVCProfileBaseline
+                        else -> if (Build.VERSION.SDK_INT >= 27 && CodecProfileLevel.AVCProfileConstrainedBaseline in profiles) {
                             CodecProfileLevel.AVCProfileConstrainedBaseline
-                        else -> CodecProfileLevel.AVCProfileBaseline
+                        } else {
+                            CodecProfileLevel.AVCProfileBaseline
+                        }
                     }
                     setInteger(MediaFormat.KEY_PROFILE, profile)
                     setInteger(MediaFormat.KEY_LEVEL, avcLevelFor(cfg.width, cfg.height, cfg.fps))
@@ -207,6 +218,11 @@ class VideoEncoder private constructor(
                 // If the camera stalls (e.g. during reconfiguration), keep emitting frames.
                 setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setInteger(MediaFormat.KEY_LATENCY, 1)
+                when {
+                    cfg.operatingRate < 0 -> setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
+                    cfg.operatingRate > 0 -> setInteger(MediaFormat.KEY_OPERATING_RATE, cfg.operatingRate)
+                }
+                cfg.vendor.forEach { (k, v) -> setInteger(k, v) }
             }
 
         /** Smallest H.264 level whose MaxFS and MaxMBPS fit the stream. */

@@ -66,6 +66,7 @@ class DecodedFrame:
     pts_us: int  # phone clock
     decoded_us: int  # PC clock
     rotation: int = 0  # clockwise degrees to make the frame upright (VIDEO flag bits 1-2)
+    received_us: int = 0  # PC clock, when the packet was read from the socket
 
 
 @dataclass
@@ -73,7 +74,9 @@ class Stats:
     fps_in: float = 0.0
     fps_decoded: float = 0.0
     bitrate_bps: float = 0.0
-    latency_ms: float | None = None  # capture -> decoded (phase 3: -> written to v4l2)
+    latency_ms: float | None = None  # capture -> decoded
+    received_ms: float | None = None  # capture -> received on the PC (phone pipeline + network)
+    decode_ms: float | None = None  # avcodec time per frame
     rtt_ms: float | None = None
     dropped_phone: int = 0
     decoder: str = ""
@@ -101,6 +104,7 @@ class StreamClient:
         self.adb = adb
         self.clock = ClockSync()
         self.decoder_name = ""
+        self.decoder_mode = "software"  # or "vaapi"; applied live by the decode thread
         # One slot per consumer: GUI preview, and (phase 3) the virtual camera output.
         self.preview_slot: LatestFrameSlot[DecodedFrame] = LatestFrameSlot()
         self.output_slot: LatestFrameSlot[DecodedFrame] = LatestFrameSlot()
@@ -118,6 +122,7 @@ class StreamClient:
         self._decoded = 0
         self._lat_sum = 0
         self._lat_n = 0
+        self._recv_sum = self._dec_sum = self._dec_n = 0
         self._phone_stats: dict[str, Any] = {}
         self._size = (0, 0)
 
@@ -233,7 +238,7 @@ class StreamClient:
         self._reset_counters()
         session_stop = threading.Event()
         decode_q: queue.Queue[tuple[int, bytes, int, bool] | None] = queue.Queue(maxsize=8)
-        decoder = H264Decoder()
+        decoder = H264Decoder(self.decoder_mode)
         self.decoder_name = decoder.name
         workers = [
             threading.Thread(
@@ -270,7 +275,7 @@ class StreamClient:
             self._packets += 1
             self._bytes += len(p.payload) + 20
             if p.type in (PacketType.CONFIG, PacketType.VIDEO):
-                item = (p.type, p.payload, p.pts_us, p.flags)
+                item = (p.type, p.payload, p.pts_us, p.flags, now_us())
                 while True:
                     try:
                         decode_q.put(item, timeout=0.5)
@@ -294,17 +299,31 @@ class StreamClient:
                 decoder.reset()
 
     def _decode_one(
-        self, decoder: H264Decoder, ptype: int, payload: bytes, pts_us: int, flags: int
+        self,
+        decoder: H264Decoder,
+        ptype: int,
+        payload: bytes,
+        pts_us: int,
+        flags: int,
+        recv_us: int,
     ) -> None:
+        if decoder.mode != self.decoder_mode:  # switched in the GUI: reopen, ask for an IDR
+            decoder.set_mode(self.decoder_mode)
+            self.send_request("request_keyframe")
         if ptype == PacketType.CONFIG:
             decoder.configure(payload)
+            self.decoder_name = decoder.name
             return
-        t0 = time.perf_counter()
         key = bool(flags & FLAG_KEYFRAME)
         rotation = ((flags >> 1) & 0x3) * 90
-        for frame in decoder.decode(payload, pts_us, key):
+        t_start = now_us()
+        frames = decoder.decode(payload, pts_us, key)
+        self.decoder_name = decoder.name
+        for frame in frames:
             t = now_us()
-            df = DecodedFrame(frame, pts_us, t, rotation)
+            self._dec_sum += t - t_start
+            self._dec_n += 1
+            df = DecodedFrame(frame, pts_us, t, rotation, recv_us)
             self.preview_slot.put(df)
             self.output_slot.put(df)
             self._decoded += 1
@@ -312,12 +331,18 @@ class StreamClient:
             pc_capture = self.clock.phone_to_pc(pts_us)
             if pc_capture is not None:
                 self._lat_sum += t - pc_capture
+                self._recv_sum += recv_us - pc_capture
                 self._lat_n += 1
-            if log.isEnabledFor(logging.DEBUG) and self._decoded % 30 == 0:
+            if (
+                log.isEnabledFor(logging.DEBUG)
+                and self._decoded % 30 == 0
+                and pc_capture is not None
+            ):
                 log.debug(
-                    "decode %.1f ms, capture->decoded %s ms",
-                    (time.perf_counter() - t0) * 1000,
-                    None if pc_capture is None else (t - pc_capture) / 1000,
+                    "stages: capture->received %.1f ms, decode %.1f ms, capture->decoded %.1f ms",
+                    (recv_us - pc_capture) / 1000,
+                    (t - t_start) / 1000,
+                    (t - pc_capture) / 1000,
                 )
 
     # ------------------------------------------------------------------ control
@@ -383,6 +408,7 @@ class StreamClient:
     def _report_stats(self, dt: float) -> None:
         packets, nbytes, decoded = self._packets, self._bytes, self._decoded
         lat_sum, lat_n = self._lat_sum, self._lat_n
+        recv_sum, dec_sum, dec_n = self._recv_sum, self._dec_sum, self._dec_n
         self._reset_counters()
         rtt = self.clock.last_rtt_us
         phone = self._phone_stats
@@ -392,6 +418,8 @@ class StreamClient:
                 fps_decoded=decoded / dt,
                 bitrate_bps=nbytes * 8 / dt,
                 latency_ms=(lat_sum / lat_n / 1000) if lat_n else None,
+                received_ms=(recv_sum / lat_n / 1000) if lat_n else None,
+                decode_ms=(dec_sum / dec_n / 1000) if dec_n else None,
                 rtt_ms=None if rtt is None else rtt / 1000,
                 dropped_phone=int(phone.get("dropped_total", 0) or 0),
                 decoder=self.decoder_name,
@@ -404,6 +432,7 @@ class StreamClient:
     def _reset_counters(self) -> None:
         self._packets = self._bytes = self._decoded = 0
         self._lat_sum = self._lat_n = 0
+        self._recv_sum = self._dec_sum = self._dec_n = 0
 
     def _close_sockets(self) -> None:
         with self._lock:

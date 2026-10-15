@@ -120,6 +120,18 @@
     ]
   },
   {
+    "file": "12-video-rotated.hex",
+    "description": "VIDEO keyframe with rotation hint 90 deg (flags bits 1-2 = 1)",
+    "packets": [
+      {
+        "type": 3,
+        "flags": 3,
+        "pts_us": "1000",
+        "payload": "0000000165b8000c3f0a1b2c3d4e5f60"
+      }
+    ]
+  },
+  {
     "file": "11-stream.hex",
     "description": "several packets back to back",
     "packets": [

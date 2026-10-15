@@ -73,7 +73,13 @@ JSON payloads are UTF-8 objects without a BOM. Receivers ignore unknown keys.
 | Bit | Name       | Valid on | Meaning |
 |-----|------------|----------|---------|
 | 0   | `KEYFRAME` | `VIDEO`  | Access unit contains an IDR slice |
-| 1–7 | —          | —        | Reserved. Send as 0, ignore on receive |
+| 1–2 | `ROTATION` | `VIDEO`  | Quarter turns **clockwise** the receiver applies to make the frame upright (0 = 0°, 1 = 90°, 2 = 180°, 3 = 270°) |
+| 3–7 | —          | —        | Reserved. Send as 0, ignore on receive |
+
+Frames are always encoded in the sensor's native orientation, so the phone pipeline stays
+zero-copy (camera → encoder Surface). The phone computes the rotation from the sensor
+orientation, the lens facing and the selected orientation, and sends it with each frame. The PC
+rotates after decoding. The video is not mirrored; mirroring is a PC-side output option.
 
 ### 0x01 HELLO
 
@@ -140,12 +146,12 @@ encoder. The PC drops `VIDEO` packets until the first keyframe after a `CONFIG`.
 | `set_camera`        | `{"id": "1"}` or `{"facing": "front"\|"back"}` |
 | `set_resolution`    | `{"width": int, "height": int}` |
 | `set_fps`           | `{"fps": int}` |
-| `set_bitrate`       | `{"bps": int}` (applied live, no encoder restart) |
+| `set_bitrate`       | `{"bps": int}` (250 000 – 40 000 000, applied live, no encoder restart) |
 | `set_torch`         | `{"on": bool}` |
-| `focus_at`          | `{"x": float, "y": float}`, normalized 0..1 in the frame **as streamed** |
-| `set_af`            | `{"mode": "auto"\|"continuous-video"\|"continuous-picture"\|"macro"\|"off"\|"locked"}` |
+| `focus_at`          | `{"x": float, "y": float}`, normalized 0..1 in the frame **as streamed**, after rotation but before any PC-side mirroring. Sets an AF/AE metering region and runs a one-shot AF scan; the AF mode becomes `locked` |
+| `set_af`            | `{"mode": "auto"\|"continuous-video"\|"continuous-picture"\|"macro"\|"off"\|"locked"}`. Only modes listed in the camera's `af_modes` are accepted. `locked` runs one scan and holds it |
 | `set_exposure_comp` | `{"ev": float}` (EV; the phone rounds to its step) |
-| `set_orientation`   | `{"orientation": "landscape"\|"portrait"}` |
+| `set_orientation`   | `{"orientation": "landscape"\|"portrait"\|"auto"}`. Landscape means the phone is held with its top to the left; auto follows the phone's orientation sensor |
 | `request_keyframe`  | `{}` |
 | `get_status`        | `{}` |
 
@@ -160,15 +166,18 @@ encoder. The PC drops `VIDEO` packets until the first keyframe after a `CONFIG`.
 
 The phone sends `STATE` without being asked whenever any setting changes, including changes made on
 the phone's own UI. The PC treats it as authoritative and updates its controls to match.
+Requests are validated synchronously and applied asynchronously: `CONTROL_RES` reports the
+requested settings, and the camera/encoder catch up shortly after (an encoder restart for
+resolution or fps changes is followed by a new `CONFIG`).
 
 ```json
 {
   "streaming": true,
   "camera_id": "0", "facing": "back",
   "width": 1280, "height": 720, "fps": 30, "bitrate": 6000000,
-  "orientation": "landscape",
+  "orientation": "landscape", "rotation": 0,
   "torch": false, "af_mode": "continuous-video", "exposure_comp": 0.0,
-  "encoder": "c2.mtk.avc.encoder"
+  "encoder": "c2.mtk.avc.encoder", "bitrate_range": [250000, 40000000]
 }
 ```
 

@@ -5,6 +5,7 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.os.Build
@@ -28,6 +29,10 @@ data class CaptureParams(
     val torch: Boolean = false,
     val aeCompensation: Int = 0,
     val recording: Boolean = true,
+    /** Tap-to-focus/metering region in active-array coordinates (null = whole frame). */
+    val region: MeteringRectangle? = null,
+    val maxAfRegions: Int = 0,
+    val maxAeRegions: Int = 0,
 )
 
 /**
@@ -116,23 +121,47 @@ class CameraController(
         Log.i(TAG, "capture session started with ${surfaces.size} surface(s), $params")
     }
 
-    fun applyParams(params: CaptureParams) {
-        val dev = device ?: return
-        val s = session ?: return
+    private var lastParams: CaptureParams? = null
+
+    private fun buildRequest(params: CaptureParams, afTrigger: Int): CaptureRequest? {
+        val dev = device ?: return null
         val template = if (params.recording) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
-        val req = dev.createCaptureRequest(template).apply {
+        return dev.createCaptureRequest(template).apply {
             sessionSurfaces.forEach { addTarget(it) }
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
             set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, params.fpsRange)
             set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, params.aeCompensation)
             set(CaptureRequest.CONTROL_AF_MODE, params.afMode)
+            set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
             set(CaptureRequest.FLASH_MODE, if (params.torch) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+            params.region?.let { r ->
+                if (params.maxAfRegions > 0) set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(r))
+                if (params.maxAeRegions > 0) set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(r))
+            }
         }.build()
+    }
+
+    fun applyParams(params: CaptureParams) {
+        val s = session ?: return
+        val req = buildRequest(params, CaptureRequest.CONTROL_AF_TRIGGER_IDLE) ?: return
+        lastParams = params
         try {
             s.setRepeatingRequest(req, null, handler)
         } catch (e: Exception) {
             Log.w(TAG, "setRepeatingRequest failed", e)
+        }
+    }
+
+    /** One-shot AF scan (tap-to-focus): cancel any running scan, then start a new one. */
+    fun triggerAutofocus() {
+        val s = session ?: return
+        val params = lastParams ?: return
+        try {
+            buildRequest(params, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)?.let { s.capture(it, null, handler) }
+            buildRequest(params, CaptureRequest.CONTROL_AF_TRIGGER_START)?.let { s.capture(it, null, handler) }
+        } catch (e: Exception) {
+            Log.w(TAG, "AF trigger failed", e)
         }
     }
 

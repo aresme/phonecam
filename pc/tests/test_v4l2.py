@@ -142,3 +142,54 @@ def test_real_device_accepts_both_formats() -> None:
             w.write(pack(rgb_frame(640, 360), 640, 360, fmt))
         finally:
             w.close()
+
+
+def marker_frame(w: int = 320, h: int = 180) -> av.VideoFrame:
+    """Black frame with a white square in the top-left corner."""
+    rgb = np.zeros((h, w, 3), np.uint8)
+    rgb[: h // 4, : w // 4] = 255
+    return av.VideoFrame.from_ndarray(rgb, format="rgb24")
+
+
+def luma(data: bytes, w: int, h: int, fmt) -> np.ndarray:
+    a = np.frombuffer(data, np.uint8)
+    if fmt is YUYV:
+        return a.reshape(h, w * 2)[:, 0::2]
+    return a[: w * h].reshape(h, w)
+
+
+def bright_corner(y: np.ndarray) -> str:
+    h, w = y.shape
+    corners = {
+        "tl": y[: h // 8, : w // 8],
+        "tr": y[: h // 8, -w // 8 :],
+        "bl": y[-h // 8 :, : w // 8],
+        "br": y[-h // 8 :, -w // 8 :],
+    }
+    return max(corners, key=lambda k: corners[k].mean())
+
+
+@pytest.mark.parametrize("fmt", [I420, YUYV])
+@pytest.mark.parametrize(
+    ("rotation", "mirror", "corner"),
+    [
+        (0, False, "tl"),
+        (90, False, "tr"),
+        (180, False, "br"),
+        (270, False, "bl"),
+        (0, True, "tr"),
+        (90, True, "tl"),
+    ],
+)
+def test_rotation_and_mirror(fmt, rotation: int, mirror: bool, corner: str) -> None:
+    quarter = rotation in (90, 270)
+    w, h = (180, 320) if quarter else (320, 180)  # output matches the upright aspect
+    data = pack(marker_frame(), w, h, fmt, rotation, mirror)
+    assert len(data) == fmt.frame_size(w, h)
+    assert bright_corner(luma(data, w, h, fmt)) == corner
+
+
+def test_rotated_portrait_is_pillarboxed_in_landscape_output() -> None:
+    data = pack(marker_frame(1280, 720), 1280, 720, I420, rotation=90)
+    y = luma(data, 1280, 720, I420)
+    assert y[:, :300].max() == 16 and y[:, -300:].max() == 16  # bars left and right

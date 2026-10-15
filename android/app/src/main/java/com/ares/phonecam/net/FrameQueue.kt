@@ -11,7 +11,7 @@ package com.ares.phonecam.net
 class FrameQueue(private val maxFrames: Int = 2) {
     sealed interface Item
     class Config(val csd: ByteArray) : Item
-    class Frame(val data: ByteArray, val ptsUs: Long, val key: Boolean) : Item
+    class Frame(val data: ByteArray, val ptsUs: Long, val key: Boolean, val extraFlags: Int = 0) : Item
 
     private val lock = Object()
     private val queue = ArrayDeque<Item>()
@@ -34,7 +34,7 @@ class FrameQueue(private val maxFrames: Int = 2) {
     }
 
     /** @return true if the caller should request a keyframe from the encoder. */
-    fun offerFrame(data: ByteArray, ptsUs: Long, key: Boolean): Boolean = synchronized(lock) {
+    fun offerFrame(data: ByteArray, ptsUs: Long, key: Boolean, extraFlags: Int = 0): Boolean = synchronized(lock) {
         if (closed) return false
         if (key) {
             if (queue.removeAll { it is Frame }) dropped += frames
@@ -48,7 +48,7 @@ class FrameQueue(private val maxFrames: Int = 2) {
             waitingForKey = true
             return true
         }
-        queue.addLast(Frame(data, ptsUs, key))
+        queue.addLast(Frame(data, ptsUs, key, extraFlags))
         frames++
         lock.notifyAll()
         return false

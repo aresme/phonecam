@@ -167,20 +167,10 @@ def _plane(frame: av.VideoFrame, index: int, rows: int, row_bytes: int) -> np.nd
     return np.frombuffer(p, np.uint8).reshape(-1, p.line_size)[:rows, :row_bytes]
 
 
-def pack(frame: av.VideoFrame, dst_w: int, dst_h: int, pixfmt: PixelFormat) -> bytes:
-    """Scale (swscale, letterboxed if the aspect differs) and pack into contiguous frame bytes."""
-    w, h, x, y = fit(frame.width, frame.height, dst_w, dst_h)
-    f = frame.reformat(width=w, height=h, format=pixfmt.av_format)
-    if pixfmt.fourcc == "YUYV":
-        src = _plane(f, 0, h, w * 2)
-        if (w, h) == (dst_w, dst_h):
-            return src.tobytes()
-        canvas = np.empty((dst_h, dst_w * 2), np.uint8)
-        canvas[:, 0::2] = 16  # Y black (limited range)
-        canvas[:, 1::2] = 128  # neutral chroma
-        canvas[y : y + h, x * 2 : (x + w) * 2] = src
-        return canvas.tobytes()
-    ys, us, vs = _plane(f, 0, h, w), _plane(f, 1, h // 2, w // 2), _plane(f, 2, h // 2, w // 2)
+def _paste_i420(
+    ys: np.ndarray, us: np.ndarray, vs: np.ndarray, dst_w: int, dst_h: int, x: int, y: int
+) -> bytes:
+    h, w = ys.shape
     if (w, h) == (dst_w, dst_h):
         return ys.tobytes() + us.tobytes() + vs.tobytes()
     cy = np.full((dst_h, dst_w), 16, np.uint8)
@@ -190,6 +180,69 @@ def pack(frame: av.VideoFrame, dst_w: int, dst_h: int, pixfmt: PixelFormat) -> b
     cu[y // 2 : (y + h) // 2, x // 2 : (x + w) // 2] = us
     cv[y // 2 : (y + h) // 2, x // 2 : (x + w) // 2] = vs
     return cy.tobytes() + cu.tobytes() + cv.tobytes()
+
+
+def _paste_yuyv(src: np.ndarray, dst_w: int, dst_h: int, x: int, y: int) -> bytes:
+    h, w2 = src.shape
+    if (w2 // 2, h) == (dst_w, dst_h):
+        return src.tobytes()
+    canvas = np.empty((dst_h, dst_w * 2), np.uint8)
+    canvas[:, 0::2] = 16  # Y black (limited range)
+    canvas[:, 1::2] = 128  # neutral chroma
+    canvas[y : y + h, x * 2 : x * 2 + w2] = src
+    return canvas.tobytes()
+
+
+def pack(
+    frame: av.VideoFrame,
+    dst_w: int,
+    dst_h: int,
+    pixfmt: PixelFormat,
+    rotation: int = 0,
+    mirror: bool = False,
+) -> bytes:
+    """Scale (swscale; letterboxed if the aspect differs), optionally rotate clockwise by
+    `rotation` degrees and mirror horizontally, and pack into contiguous frame bytes."""
+    rotation %= 360
+    quarter = rotation in (90, 270)
+    src_w, src_h = (frame.height, frame.width) if quarter else (frame.width, frame.height)
+    w, h, x, y = fit(src_w, src_h, dst_w, dst_h)  # size/position of the upright picture
+
+    if rotation == 0 and not mirror:  # fast path: swscale does everything
+        f = frame.reformat(width=w, height=h, format=pixfmt.av_format)
+        if pixfmt.fourcc == "YUYV":
+            return _paste_yuyv(_plane(f, 0, h, w * 2), dst_w, dst_h, x, y)
+        return _paste_i420(
+            _plane(f, 0, h, w),
+            _plane(f, 1, h // 2, w // 2),
+            _plane(f, 2, h // 2, w // 2),
+            dst_w,
+            dst_h,
+            x,
+            y,
+        )
+
+    # Scale in the original orientation, then rotate/mirror the I420 planes with numpy.
+    pw, ph = (h, w) if quarter else (w, h)
+    f = frame.reformat(width=pw, height=ph, format="yuv420p")
+    k = {90: -1, 180: 2, 270: 1}.get(rotation, 0)  # np.rot90: positive k = counter-clockwise
+    planes = []
+    for plane in (
+        _plane(f, 0, ph, pw),
+        _plane(f, 1, ph // 2, pw // 2),
+        _plane(f, 2, ph // 2, pw // 2),
+    ):
+        if k:
+            plane = np.rot90(plane, k)
+        if mirror:
+            plane = plane[:, ::-1]
+        planes.append(np.ascontiguousarray(plane))
+    ys, us, vs = planes
+    if pixfmt.fourcc != "YUYV":
+        return _paste_i420(ys, us, vs, dst_w, dst_h, x, y)
+    i420 = np.concatenate([ys.ravel(), us.ravel(), vs.ravel()]).reshape(h * 3 // 2, w)
+    g = av.VideoFrame.from_ndarray(i420, format="yuv420p").reformat(format="yuyv422")
+    return _paste_yuyv(_plane(g, 0, h, w * 2), dst_w, dst_h, x, y)
 
 
 def pack_rgb(rgb: np.ndarray, dst_w: int, dst_h: int, pixfmt: PixelFormat) -> bytes:

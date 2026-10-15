@@ -11,6 +11,8 @@ import android.util.Log
 import com.ares.phonecam.BuildConfig
 import com.ares.phonecam.TAG
 import com.ares.phonecam.camera.CameraInfo
+import com.ares.phonecam.camera.Facing
+import com.ares.phonecam.engine.Orientation
 import com.ares.phonecam.engine.EngineState
 import com.ares.phonecam.engine.StreamEngine
 import com.ares.phonecam.protocol.Packet
@@ -28,6 +30,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -149,6 +154,7 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
         _state.update { it.copy(controlClient = remote) }
         val writer = PacketWriter(BufferedOutputStream(sock.getOutputStream(), 64 * 1024))
         var statsJob: Job? = null
+        var stateJob: Job? = null
         try {
             val reader = PacketReader(BufferedInputStream(sock.getInputStream()))
             statsJob = scope?.launch {
@@ -159,6 +165,15 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
                     }
                 } catch (_: IOException) {
                     // socket gone; the read loop notices and cleans up
+                }
+            }
+            stateJob = scope?.launch {
+                // Push STATE whenever the published settings change (from the PC or the phone UI).
+                engine.state.map { stateJson(it).toString() }.distinctUntilChanged().drop(1).collect { json ->
+                    try {
+                        writer.write(Packet.json(PacketType.STATE, json))
+                    } catch (_: IOException) {
+                    }
                 }
             }
             while (true) {
@@ -180,6 +195,7 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
             Log.w(TAG, "control client $remote failed", e)
         } finally {
             statsJob?.cancel()
+            stateJob?.cancel()
             runCatching { sock.close() }
             if (control === sock) {
                 control = null
@@ -188,15 +204,37 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
         }
     }
 
-    /** Phase 2 subset; the full command set arrives in phase 4. */
+    /** CONTROL_REQ → CONTROL_RES. Validation errors are reported with ok=false. */
     private fun handleRequest(p: Packet): JSONObject {
         val req = JSONObject(p.payload.decodeToString())
+        val args = req.optJSONObject("args") ?: JSONObject()
+        val cmd = req.optString("cmd")
         val res = JSONObject().put("id", req.opt("id"))
-        when (req.optString("cmd")) {
-            "request_keyframe" -> { engine.requestKeyframe(); res.put("ok", true) }
-            "get_status" -> res.put("ok", true)
-            else -> res.put("ok", false).put("error", "unsupported command: ${req.optString("cmd")}")
+        try {
+            when (cmd) {
+                "set_camera" -> if (args.has("id")) engine.setCamera(args.getString("id"))
+                else engine.setFacing(Facing.entries.firstOrNull { it.wire == args.optString("facing") }
+                    ?: throw IllegalArgumentException("set_camera needs id or facing"))
+                "set_resolution" -> engine.setResolution(args.getInt("width"), args.getInt("height"))
+                "set_fps" -> engine.setFps(args.getInt("fps"))
+                "set_bitrate" -> engine.setBitrate(args.getInt("bps"))
+                "set_torch" -> engine.setTorch(args.getBoolean("on"))
+                "focus_at" -> engine.focusAt(args.getDouble("x").toFloat(), args.getDouble("y").toFloat())
+                "set_af" -> engine.setAfMode(args.getString("mode"))
+                "set_exposure_comp" -> engine.setExposureEv(args.getDouble("ev").toFloat())
+                "set_orientation" -> engine.setOrientation(Orientation.fromWire(args.optString("orientation"))
+                    ?: throw IllegalArgumentException("orientation must be landscape, portrait or auto"))
+                "request_keyframe" -> engine.requestKeyframe()
+                "get_status" -> Unit
+                else -> throw IllegalArgumentException("unknown command: $cmd")
+            }
+            res.put("ok", true)
+        } catch (e: IllegalArgumentException) {
+            res.put("ok", false).put("error", e.message)
+        } catch (e: org.json.JSONException) {
+            res.put("ok", false).put("error", "bad arguments for $cmd: ${e.message}")
         }
+        Log.i(TAG, "control $cmd $args -> ${res.optBoolean("ok")} ${res.optString("error")}")
         return res.put("state", stateJson(engine.state.value))
     }
 
@@ -217,12 +255,8 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
         .put("sizes", JSONArray(c.sizes.map { JSONArray(listOf(it.width, it.height)) }))
         .put("fps_ranges", JSONArray(c.fpsRanges.map { JSONArray(listOf(it.lower, it.upper)) }))
         .put("has_flash", c.hasFlash)
-        .put("af_modes", JSONArray(c.afModes.mapNotNull(::afModeName)))
+        .put("af_modes", JSONArray(c.afModeNames + if ("auto" in c.afModeNames) listOf("locked") else emptyList()))
         .put("exposure_comp", JSONObject().put("min", c.aeCompRange.lower).put("max", c.aeCompRange.upper).put("step", c.aeCompStep.toDouble()))
-
-    private fun afModeName(mode: Int) = when (mode) {
-        0 -> "off"; 1 -> "auto"; 2 -> "macro"; 3 -> "continuous-video"; 4 -> "continuous-picture"; else -> null
-    }
 
     private fun stateJson(st: EngineState): JSONObject {
         val cfg = st.config
@@ -231,9 +265,13 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
             .put("camera_id", cfg?.cameraId)
             .put("facing", st.camera?.facing?.wire)
             .put("width", cfg?.width).put("height", cfg?.height).put("fps", cfg?.fps).put("bitrate", cfg?.bitrate)
-            .put("orientation", "landscape")
-            .put("torch", false).put("af_mode", "continuous-video").put("exposure_comp", 0.0)
+            .put("orientation", st.controls.orientation.wire)
+            .put("rotation", st.rotation)
+            .put("torch", st.controls.torch)
+            .put("af_mode", st.controls.afMode)
+            .put("exposure_comp", st.camera?.evForIndex(st.controls.aeCompIndex)?.toDouble() ?: 0.0)
             .put("encoder", st.encoderName)
+            .put("bitrate_range", JSONArray(listOf(com.ares.phonecam.engine.MIN_BITRATE, com.ares.phonecam.engine.MAX_BITRATE)))
     }
 
     private fun statsJson(remote: String): JSONObject {

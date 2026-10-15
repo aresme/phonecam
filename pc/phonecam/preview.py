@@ -8,7 +8,7 @@ import threading
 import time
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPaintEvent
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPaintEvent, QTransform
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from phonecam.client import DecodedFrame
@@ -30,6 +30,7 @@ class PreviewWorker(QObject):
         self._period = 1.0 / max_fps
         self._stop = threading.Event()
         self.enabled = True
+        self.mirror = False
         self._thread = threading.Thread(target=self._run, name="preview", daemon=True)
 
     def start(self) -> None:
@@ -58,6 +59,11 @@ class PreviewWorker(QObject):
                 log.exception("preview conversion failed")
                 continue
             img = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
+            # Show exactly what the virtual camera gets: upright, optionally mirrored.
+            if df.rotation:
+                img = img.transformed(QTransform().rotate(df.rotation))
+            if self.mirror:
+                img = img.flipped(Qt.Orientation.Horizontal)
             self.frame.emit(img)
 
 

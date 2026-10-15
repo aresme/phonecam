@@ -24,7 +24,7 @@ class FileSink(val file: File) : FrameSink {
     }
 
     @Synchronized
-    override fun onFrame(data: ByteArray, ptsUs: Long, keyframe: Boolean) {
+    override fun onFrame(data: ByteArray, ptsUs: Long, keyframe: Boolean, extraFlags: Int) {
         if (closed || !haveConfig) return
         if (!started && !keyframe) return // a decodable file starts at an IDR
         started = true

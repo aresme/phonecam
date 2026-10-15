@@ -9,10 +9,11 @@ from typing import Any
 
 import numpy as np
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QImage, QPainter
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QImage, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QGroupBox,
@@ -20,10 +21,11 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPushButton,
     QRadioButton,
-    QSlider,
     QSplitter,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +33,8 @@ from PySide6.QtWidgets import (
 from phonecam import __version__
 from phonecam.adb import Adb, AdbDevice, AdbError, find_adb
 from phonecam.client import Stats, StreamClient, Target
+from phonecam.controls import ControlsPanel
+from phonecam.desktop import icon_path
 from phonecam.output import VirtualCamera
 from phonecam.preview import PreviewWidget, PreviewWorker
 from phonecam.setup_dialog import SetupDialog
@@ -57,7 +61,7 @@ QLabel#muted { color: #9aa4b2; }
 QPushButton#vcamOn { background: #2e7d32; border-color: #2e7d32; color: white; font-weight: 600; }
 """
 
-OUTPUT_SIZES = [(1280, 720), (1920, 1080), (960, 540), (640, 360)]
+OUTPUT_SIZES = [(1280, 720), (1920, 1080), (960, 540), (640, 360), (720, 1280), (1080, 1920)]
 
 
 def render_placeholder(width: int, height: int, message: str) -> np.ndarray:
@@ -199,8 +203,19 @@ class MainWindow(QMainWindow):
             )
             self.wifi_radio.setChecked(True)
             self.usb_radio.setEnabled(False)
+        self._quitting = False
+        self._tray_hint_shown = False
+        self._autoconnect_pending = self.autoconnect.isChecked()
+        self.setWindowIcon(QIcon(str(icon_path())))
+        self._setup_tray()
+        self.controls.request.connect(self._send_request)
+        self.controls.mirror_changed.connect(self._on_mirror)
+        self.bridge.state.connect(self.controls.set_state)
+        self.preview.clicked.connect(self._on_preview_clicked)
         self._restore_settings()
         QTimer.singleShot(0, self._init_vcam)
+        if self._autoconnect_pending and self.wifi_radio.isChecked():
+            QTimer.singleShot(500, self._try_autoconnect)
 
     # ------------------------------------------------------------------ layout
 
@@ -232,6 +247,12 @@ class MainWindow(QMainWindow):
         self.launch_btn.setToolTip("Opens PhoneCam on the selected USB device and starts streaming")
         self.launch_btn.clicked.connect(self._launch_on_phone)
         lay.addWidget(self.launch_btn)
+        self.autoconnect = QCheckBox("Connect automatically on launch")
+        self.autoconnect.setChecked(
+            QSettings("PhoneCam", "PhoneCam").value("conn/autoconnect", False, bool)
+        )
+        self.autoconnect.toggled.connect(lambda on: self.settings.setValue("conn/autoconnect", on))
+        lay.addWidget(self.autoconnect)
         self.conn_status = QLabel("Disconnected")
         self.conn_status.setWordWrap(True)
         lay.addWidget(self.conn_status)
@@ -246,18 +267,8 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        cam = QGroupBox("Camera")
-        form = QFormLayout(cam)
-        form.addRow(QPushButton("Switch camera"))
-        form.addRow("Resolution", QComboBox())
-        form.addRow("FPS", QComboBox())
-        form.addRow("Bitrate", QSlider(Qt.Orientation.Horizontal))
-        form.addRow(QPushButton("Torch"))
-        form.addRow("Focus", QComboBox())
-        form.addRow("Exposure", QSlider(Qt.Orientation.Horizontal))
-        for w in cam.findChildren(QWidget):
-            w.setEnabled(False)  # camera controls arrive in phase 4
-        lay.addWidget(cam)
+        self.controls = ControlsPanel()
+        lay.addWidget(self.controls)
 
         vc = QGroupBox("Virtual camera")
         vform = QFormLayout(vc)
@@ -272,7 +283,7 @@ class MainWindow(QMainWindow):
         vform.addRow(self.vcam_device)
         self.vcam_size = QComboBox()
         for w, h in OUTPUT_SIZES:
-            self.vcam_size.addItem(f"{w}×{h}", (w, h))
+            self.vcam_size.addItem(f"{w}×{h}", f"{w}x{h}")  # str: findData-safe
         vform.addRow("Output", self.vcam_size)
         self.vcam_format = QComboBox()
         for key, fmt in PIXEL_FORMATS.items():
@@ -324,7 +335,7 @@ class MainWindow(QMainWindow):
     def _on_vcam_toggled(self, on: bool) -> None:
         if on:
             device = find_loopback()
-            size = self.vcam_size.currentData()
+            size = [int(v) for v in self.vcam_size.currentData().split("x")]
             fmt = PIXEL_FORMATS[self.vcam_format.currentData()]
             try:
                 if device is None:
@@ -346,7 +357,7 @@ class MainWindow(QMainWindow):
         self._restyle(self.vcam_btn)
         self.vcam_size.setEnabled(not on)
         self.vcam_format.setEnabled(not on)
-        self.settings.setValue("vcam/size", list(self.vcam_size.currentData()))
+        self.settings.setValue("vcam/size", self.vcam_size.currentData().split("x"))
         self.settings.setValue("vcam/format", self.vcam_format.currentData())
 
     def _vcam_message(self) -> str:
@@ -375,9 +386,10 @@ class MainWindow(QMainWindow):
         self.ip_edit.setText(st.value("conn/ip", "", str))
         size = st.value("vcam/size", None)
         if size:
-            idx = self.vcam_size.findData((int(size[0]), int(size[1])))
+            idx = self.vcam_size.findData(f"{int(size[0])}x{int(size[1])}")
             if idx >= 0:
                 self.vcam_size.setCurrentIndex(idx)
+        self.controls.mirror.setChecked(st.value("vcam/mirror", False, bool))
         idx = self.vcam_format.findData(st.value("vcam/format", "I420", str))
         if idx >= 0:
             self.vcam_format.setCurrentIndex(idx)
@@ -422,6 +434,7 @@ class MainWindow(QMainWindow):
         self._restyle(self.connect_btn)
         self.preview.clear("Connecting…")
         run_bg(lambda: self.client.connect(target), "connect")
+        self._update_tray()
 
     def _launch_on_phone(self) -> None:
         serial = self._selected_serial()
@@ -458,6 +471,8 @@ class MainWindow(QMainWindow):
         self.vcam.message = self._vcam_message()
         self.conn_status.setText(status)
         self.statusBar().showMessage(status)
+        self.controls.set_connected(connected)
+        self._update_tray()
         if connected:
             self.preview.set_message("")
         elif self._active:
@@ -474,6 +489,7 @@ class MainWindow(QMainWindow):
             self.stats_label.setText(self._format_stats(None))
 
     def _on_hello(self, hello: dict[str, Any]) -> None:
+        self.controls.set_capabilities(hello)
         dev = hello.get("device", {})
         state = hello.get("state", {})
         enc = state.get("encoder") or "?"
@@ -511,11 +527,105 @@ class MainWindow(QMainWindow):
             idx = next((i for i, d in enumerate(devices) if d.ready), -1)
         self.device_combo.setCurrentIndex(idx)
         self.device_combo.blockSignals(False)
+        if self._autoconnect_pending and idx >= 0 and not self.wifi_radio.isChecked():
+            self._try_autoconnect()
 
     def _on_error(self, message: str) -> None:
         self.conn_status.setText(message)
 
+    # ------------------------------------------------------------------ controls / tray
+
+    def _send_request(self, cmd: str, args: dict[str, Any]) -> None:
+        run_bg(lambda: self.client.send_request(cmd, **args), "request")
+
+    def _on_preview_clicked(self, x: float, y: float) -> None:
+        if not self._connected:
+            return
+        # The preview shows the (optionally mirrored) upright stream; the phone expects
+        # coordinates in the unmirrored streamed frame.
+        if self.controls.mirror.isChecked():
+            x = 1.0 - x
+        self._send_request("focus_at", {"x": round(x, 4), "y": round(y, 4)})
+        self.statusBar().showMessage(f"Focusing at {x:.2f}, {y:.2f}", 2000)
+
+    def _on_mirror(self, on: bool) -> None:
+        self.vcam.mirror = on
+        self.preview_worker.mirror = on
+        self.settings.setValue("vcam/mirror", on)
+
+    def _try_autoconnect(self) -> None:
+        if self._autoconnect_pending and not self._active:
+            self._autoconnect_pending = False
+            log.info("auto-connecting")
+            self._toggle_connect()
+
+    def _setup_tray(self) -> None:
+        self.tray: QSystemTrayIcon | None = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            log.info(
+                "no system tray (on GNOME, install the AppIndicator extension); running without"
+            )
+            return
+        tray = QSystemTrayIcon(self.windowIcon(), self)
+        menu = QMenu()
+        self.tray_show = QAction("Show window", self, triggered=self._show_window)
+        self.tray_connect = QAction("Connect", self, triggered=self._toggle_connect)
+        self.tray_switch = QAction("Switch camera", self, triggered=self.controls.switch_camera)
+        self.tray_vcam = QAction("Virtual camera", self, checkable=True)
+        self.tray_vcam.triggered.connect(self.vcam_btn.click)
+        quit_action = QAction("Quit", self, triggered=self._quit)
+        for a in (self.tray_show, self.tray_connect, self.tray_switch, self.tray_vcam):
+            menu.addAction(a)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        tray.setContextMenu(menu)
+        tray.setToolTip("PhoneCam")
+        tray.activated.connect(
+            lambda reason: (
+                self._show_window() if reason == QSystemTrayIcon.ActivationReason.Trigger else None
+            )
+        )
+        tray.show()
+        self._tray_menu = menu
+        self.tray = tray
+        self.vcam_btn.toggled.connect(lambda _: self._update_tray())
+        self._update_tray()
+
+    def _update_tray(self) -> None:
+        if self.tray is None:
+            return
+        self.tray_connect.setText("Disconnect" if self._active else "Connect")
+        self.tray_switch.setEnabled(self._connected)
+        self.tray_vcam.setEnabled(self.vcam_btn.isEnabled())
+        self.tray_vcam.setChecked(self.vcam_btn.isChecked())
+        self.tray.setToolTip(f"PhoneCam — {self.conn_status.text()}")
+
+    def _show_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit(self) -> None:
+        self._quitting = True
+        self.close()
+        QApplication.quit()  # quitOnLastWindowClosed is off while a tray icon exists
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.tray is not None and not self._quitting:
+            # Keep streaming in the background; quit from the tray menu.
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(
+                    "PhoneCam",
+                    "Still running in the tray. Use Quit to exit.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+            return
+        if self.tray is not None:
+            self.tray.hide()
         self.vcam_timer.stop()
         if self.adb_monitor:
             self.adb_monitor.stop()
@@ -534,7 +644,10 @@ def run(argv: list[str]) -> int:
     app.setDesktopFileName("phonecam")
     app.setApplicationVersion(__version__)
     app.setStyleSheet(STYLE)
+    app.setQuitOnLastWindowClosed(False)
     win = MainWindow()
+    if win.tray is None:
+        app.setQuitOnLastWindowClosed(True)
     win.show()
     log.info("PhoneCam %s started", __version__)
     return app.exec()

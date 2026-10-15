@@ -28,7 +28,17 @@ data class CameraInfo(
     /** SENSOR_INFO_TIMESTAMP_SOURCE == REALTIME: sensor timestamps are elapsedRealtimeNanos. */
     val timestampRealtime: Boolean,
     val hardwareLevel: Int,
+    val activeArray: android.graphics.Rect,
+    val maxAfRegions: Int,
+    val maxAeRegions: Int,
 ) {
+    val afModeNames: List<String> get() = afModes.mapNotNull(::afModeName)
+
+    /** Exposure compensation in EV for an index, and the nearest index for an EV value. */
+    fun evForIndex(index: Int): Float = index * aeCompStep.toFloat()
+    fun indexForEv(ev: Float): Int =
+        Math.round(ev / aeCompStep.toFloat()).coerceIn(aeCompRange.lower, aeCompRange.upper)
+
     /** Best AE fps range for a target fps: fixed [fps,fps] if possible, else highest floor with that ceiling. */
     fun fpsRangeFor(fps: Int): Range<Int> =
         fpsRanges.firstOrNull { it.lower == fps && it.upper == fps }
@@ -36,6 +46,25 @@ data class CameraInfo(
             ?: fpsRanges.minBy { kotlin.math.abs(it.upper - fps) * 100 - it.lower }
 
     val supportedFps: List<Int> get() = fpsRanges.map { it.upper }.distinct().sorted()
+}
+
+/** Protocol names for CONTROL_AF_MODE values. */
+fun afModeName(mode: Int): String? = when (mode) {
+    CameraMetadata.CONTROL_AF_MODE_OFF -> "off"
+    CameraMetadata.CONTROL_AF_MODE_AUTO -> "auto"
+    CameraMetadata.CONTROL_AF_MODE_MACRO -> "macro"
+    CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO -> "continuous-video"
+    CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE -> "continuous-picture"
+    else -> null
+}
+
+fun afModeValue(name: String): Int? = when (name) {
+    "off" -> CameraMetadata.CONTROL_AF_MODE_OFF
+    "auto", "locked" -> CameraMetadata.CONTROL_AF_MODE_AUTO
+    "macro" -> CameraMetadata.CONTROL_AF_MODE_MACRO
+    "continuous-video" -> CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+    "continuous-picture" -> CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+    else -> null
 }
 
 object CameraCatalog {
@@ -77,6 +106,9 @@ object CameraCatalog {
             timestampRealtime = c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
                 CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME,
             hardwareLevel = c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1,
+            activeArray = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: android.graphics.Rect(0, 0, 1, 1),
+            maxAfRegions = c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0,
+            maxAeRegions = c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0,
         )
         Log.i(TAG, "camera $id ${info.facing} orient=${info.sensorOrientation} level=${info.hardwareLevel} " +
             "fps=${info.fpsRanges} realtimeTs=${info.timestampRealtime} sizes=${info.sizes.take(8)}")

@@ -58,6 +58,7 @@ class VirtualCamera:
         self._thread: threading.Thread | None = None
         self._writer: V4L2Writer | None = None
         self.message = "PhoneCam disconnected"
+        self.mirror = False  # horizontal flip of the output (like a mirror)
         self.error: str | None = None
         self.width, self.height, self.pixfmt = 1280, 720, YUYV
         self._written = 0
@@ -131,7 +132,9 @@ class VirtualCamera:
                 now = time.monotonic()
                 if df is not None:
                     t0 = time.perf_counter()
-                    data = pack(df.frame, self.width, self.height, self.pixfmt)
+                    data = pack(
+                        df.frame, self.width, self.height, self.pixfmt, df.rotation, self.mirror
+                    )
                     writer.write(data)
                     t_written = now_us()
                     self._pack_sum += time.perf_counter() - t0

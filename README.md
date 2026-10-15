@@ -8,8 +8,9 @@ OBS, Firefox and Chrome can use.
 No third-party streaming libraries are used. The wire protocol is our own: see
 [docs/protocol.md](docs/protocol.md).
 
-> **Status:** Phase 3. The phone appears as the **PhoneCam** webcam (`/dev/video10`) in Chrome,
-> Firefox, Meet and OBS, with auto-reconnect and a placeholder image while disconnected.
+> **Status:** Phase 4. PhoneCam webcam (`/dev/video10`) with full remote control from the PC
+> (camera, resolution, fps, bitrate, torch, focus, exposure, orientation), kept in sync with the
+> phone's own controls. Tray icon and app-grid entry.
 
 > **Security:** the stream is unencrypted and unauthenticated. Use it over USB or on a trusted
 > LAN only.
@@ -63,6 +64,13 @@ scripts/setup-v4l2loopback.sh --persist   # installs v4l2loopback-dkms if needed
 
 This creates `/dev/video10` with the label `PhoneCam` and `exclusive_caps=1` (required by Chrome).
 
+## Install in the app grid
+
+```bash
+pc/.venv/bin/phonecam --install-desktop    # ~/.local/share/applications + icon
+pc/.venv/bin/phonecam --uninstall-desktop
+```
+
 ## Daily use (USB)
 
 1. Plug in the phone (USB debugging on) and start the PC app: `pc/.venv/bin/phonecam`.
@@ -72,6 +80,33 @@ This creates `/dev/video10` with the label `PhoneCam` and `exclusive_caps=1` (re
 4. In Meet/Zoom/OBS/the browser, pick the camera **PhoneCam**. The virtual camera is on by
    default and shows a "PhoneCam disconnected" card while the phone isn't connected, so apps
    keep the device. Output size and format (I420 default, YUYV fallback) are in the right panel.
+
+### Controls
+
+Everything can be changed from either side, and both UIs stay in sync:
+
+- **PC (right panel):** camera, resolution, fps, bitrate, torch, focus mode, exposure,
+  orientation, and *Mirror output*. Click the preview to focus at that point; the focus mode
+  becomes *Locked*. Choose *Continuous* to return to autofocus.
+- **Phone:** switch camera, torch, AF auto/locked, and the EV slider under the preview. Tap the
+  preview to focus. The ⚙ settings sheet has resolution, fps, bitrate, orientation, stats overlay,
+  keep screen on, and record to file.
+- **Orientation:** *Landscape* assumes the phone is held with its top to the left. *Portrait*
+  streams upright for a phone standing upright, *Auto* follows the phone. For a portrait
+  stream, pick a portrait output size (720×1280) in the virtual camera panel; otherwise it is
+  pillarboxed.
+- Settings are remembered on both sides (phone: DataStore, PC: `~/.config/PhoneCam/PhoneCam.conf`).
+  *Connect automatically on launch* reconnects to the last device.
+
+### Tray icon
+
+With a tray (Ubuntu's AppIndicator extension, enabled by default), closing the window keeps
+PhoneCam running in the tray. The tray menu has Show window, Connect/Disconnect, Switch camera,
+Virtual camera and Quit. Without a tray (plain GNOME without the extension), closing the window
+quits, and everything else works the same.
+
+Starting streaming at phone boot is intentionally not offered: Android 14+ does not allow
+camera foreground services to start from a boot receiver.
 
 Developing without a phone: `python -m phonecam.tools.fake_phone some.h264` serves a recording
 on 127.0.0.1. Connect to it with Wi-Fi mode and IP `127.0.0.1`.

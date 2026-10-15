@@ -45,6 +45,30 @@ Package `com.ares.phonecam`. Kotlin, Compose + Material 3, Camera2, MediaCodec, 
 Structured concurrency: the service owns a `CoroutineScope(SupervisorJob() + Dispatchers.IO)`
 that is cancelled in `onDestroy`. Camera, codec and sockets are closed in `finally` blocks.
 
+### Controls and state
+
+`StreamEngine` exposes validated setters (`setCamera`, `setResolution`, `setFps`, `setBitrate`,
+`setTorch`, `setAfMode`, `focusAt`, `setExposureEv`, `setOrientation`). Each one updates the
+desired state and publishes the requested settings in `EngineState` immediately; the camera-thread
+reconciler then applies them:
+
+| Change | Effect |
+|--------|--------|
+| bitrate | `PARAMETER_KEY_VIDEO_BITRATE`, live |
+| torch, AF mode, exposure, metering region | new repeating request; `focus_at` also runs an AF trigger |
+| camera | close session and device, open the other camera, same encoder (no new CONFIG) |
+| resolution, fps | encoder restart, so a new CONFIG and IDR |
+| orientation | only the rotation hint in VIDEO flags changes (zero-copy pipeline) |
+
+`StreamServer` turns `EngineState` into STATE JSON. It pushes STATE to the PC whenever that
+JSON changes, so changes made on the phone UI and on the PC go through the same path.
+Settings persist via DataStore (`SettingsRepository`).
+
+Tap-to-focus maps a normalized point in the displayed or streamed frame back to the sensor frame
+(undoing rotation and mirroring), then to a metering rectangle in `SENSOR_INFO_ACTIVE_ARRAY_SIZE`.
+The default crop is a centered region with the stream's aspect ratio (`camera/Geometry.kt`,
+unit tested).
+
 ### Drop policy
 
 `encoder → queue(2) → socket`. When the queue is full, a non-key frame is dropped and a sync
@@ -64,6 +88,14 @@ Python 3.14 (Ubuntu 26.04), PySide6 (system package), PyAV, numpy. Output uses d
 | `preview` | Reads its own latest-frame slot, at most 30 fps: swscale to ≤960 px wide RGB, `QImage`, then a queued signal to the GUI. | — |
 | `adb-monitor` | Polls `adb devices -l` every 1.5 s and updates the device list (unplug/replug). | Qt signal |
 | GUI (main)| Qt widgets only. Never blocks: connect, disconnect and adb calls run on short-lived background threads. Stats arrive at 2 Hz. | — |
+
+### Rotation and mirroring (PC)
+
+Rotation comes from VIDEO flag bits 1–2. Unrotated frames use the swscale fast path. Rotated or
+mirrored frames are scaled to I420 in their original orientation, then rotated or flipped plane
+by plane with numpy, and packed (I420, or converted to YUYV). At 720p this adds about 1–2 ms.
+The GUI preview applies the same transform with `QTransform`, so it shows exactly what the
+virtual camera receives.
 
 ### Pixel format
 

@@ -28,6 +28,7 @@ from phonecam.decoder import H264Decoder
 from phonecam.frameslot import LatestFrameSlot
 from phonecam.protocol import (
     CONTROL_PORT,
+    FLAG_KEYFRAME,
     VIDEO_PORT,
     PacketDecoder,
     PacketType,
@@ -64,6 +65,7 @@ class DecodedFrame:
     frame: av.VideoFrame
     pts_us: int  # phone clock
     decoded_us: int  # PC clock
+    rotation: int = 0  # clockwise degrees to make the frame upright (VIDEO flag bits 1-2)
 
 
 @dataclass
@@ -268,7 +270,7 @@ class StreamClient:
             self._packets += 1
             self._bytes += len(p.payload) + 20
             if p.type in (PacketType.CONFIG, PacketType.VIDEO):
-                item = (p.type, p.payload, p.pts_us, p.is_keyframe)
+                item = (p.type, p.payload, p.pts_us, p.flags)
                 while True:
                     try:
                         decode_q.put(item, timeout=0.5)
@@ -292,15 +294,17 @@ class StreamClient:
                 decoder.reset()
 
     def _decode_one(
-        self, decoder: H264Decoder, ptype: int, payload: bytes, pts_us: int, key: bool
+        self, decoder: H264Decoder, ptype: int, payload: bytes, pts_us: int, flags: int
     ) -> None:
         if ptype == PacketType.CONFIG:
             decoder.configure(payload)
             return
         t0 = time.perf_counter()
+        key = bool(flags & FLAG_KEYFRAME)
+        rotation = ((flags >> 1) & 0x3) * 90
         for frame in decoder.decode(payload, pts_us, key):
             t = now_us()
-            df = DecodedFrame(frame, pts_us, t)
+            df = DecodedFrame(frame, pts_us, t, rotation)
             self.preview_slot.put(df)
             self.output_slot.put(df)
             self._decoded += 1

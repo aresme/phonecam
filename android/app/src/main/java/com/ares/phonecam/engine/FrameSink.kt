@@ -8,7 +8,8 @@ interface FrameSink {
     /** SPS+PPS (Annex-B). Always delivered before the first frame, and again after encoder restarts. */
     fun onConfig(csd: ByteArray)
 
-    fun onFrame(data: ByteArray, ptsUs: Long, keyframe: Boolean)
+    /** @param extraFlags protocol VIDEO flag bits besides KEYFRAME (rotation hint, bits 1-2). */
+    fun onFrame(data: ByteArray, ptsUs: Long, keyframe: Boolean, extraFlags: Int = 0)
 
     /** Detached from the engine; release resources. */
     fun close()

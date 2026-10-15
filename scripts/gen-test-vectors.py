@@ -75,6 +75,8 @@ def main() -> None:
        [(pkt(0x7F, b"\xde\xad\xbe\xef", 0x80, 5), expect(0x7F, b"\xde\xad\xbe\xef", 0x80, 5))])
     ok("10-max-pts", "largest allowed pts (2^63-1)",
        [(pkt(0x03, P_FRAME, 0, 2**63 - 1), expect(0x03, P_FRAME, 0, 2**63 - 1))])
+    ok("12-video-rotated", "VIDEO keyframe with rotation hint 90 deg (flags bits 1-2 = 1)",
+       [(pkt(0x03, IDR, 0x03, 1000), expect(0x03, IDR, 0x03, 1000))])
     ok("11-stream", "several packets back to back",
        [(pkt(0x02, SPS_PPS), expect(0x02, SPS_PPS)),
         (pkt(0x03, IDR, 1, 1000), expect(0x03, IDR, 1, 1000)),

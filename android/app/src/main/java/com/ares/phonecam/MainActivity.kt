@@ -27,7 +27,7 @@ class MainActivity : ComponentActivity() {
             PhoneCamTheme {
                 val context = LocalContext.current
                 var granted by remember { mutableStateOf(hasCameraPermission(context)) }
-                if (granted) MainScreen(app.engine, app.server) else PermissionScreen(onGranted = { granted = true })
+                if (granted) MainScreen(app.engine, app.server, app.settings) else PermissionScreen(onGranted = { granted = true })
             }
         }
     }

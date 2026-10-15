@@ -72,7 +72,8 @@ offset size field
 | 0x20 | `PING`        | control | PC → phone | 8 bytes |
 | 0x21 | `PONG`        | control | phone → PC | 16 bytes |
 | 0x30 | `STATS`       | control | phone → PC | JSON |
-| 0x40 | `AUDIO`       | video   | phone → PC | reserved (phase 7) |
+| 0x40 | `AUDIO`       | video   | phone → PC | one encoded audio frame (20 ms) |
+| 0x41 | `AUDIO_CONFIG`| video   | phone → PC | JSON audio stream description |
 
 JSON payloads are UTF-8 objects without a BOM. Receivers ignore unknown keys.
 
@@ -164,6 +165,7 @@ encoder. The PC drops `VIDEO` packets until the first keyframe after a `CONFIG`.
 | `set_af`            | `{"mode": "auto"\|"continuous-video"\|"continuous-picture"\|"macro"\|"off"\|"locked"}`. Only modes listed in the camera's `af_modes` are accepted. `locked` runs one scan and holds it |
 | `set_exposure_comp` | `{"ev": float}` (EV; the phone rounds to its step) |
 | `set_orientation`   | `{"orientation": "landscape"\|"portrait"\|"auto"}`. Landscape means the phone is held with its top to the left; auto follows the phone's orientation sensor |
+| `set_audio`         | `{"enabled": bool}` and/or `{"mic": "voice"\|"raw"}`. Voice uses the phone's call processing (echo cancellation, noise suppression). Enabling fails if the phone app hasn't been granted the microphone permission |
 | `request_keyframe`  | `{}` |
 | `get_status`        | `{}` |
 | `set_tuning`        | *Experimental, for latency measurements.* Any of `{"template": "record"\|"preview", "noise_reduction": "default"\|"off"\|"fast"\|"hq"\|"minimal", "edge": "default"\|"off"\|"fast", "stabilization_off": bool, "profile": "auto"\|"baseline"\|"main"\|"high", "operating_rate": int (-1 = max), "vendor": {"key": int}}`. Encoder-level keys restart the encoder |
@@ -190,7 +192,8 @@ resolution or fps changes is followed by a new `CONFIG`).
   "width": 1280, "height": 720, "fps": 30, "bitrate": 6000000,
   "orientation": "landscape", "rotation": 0,
   "torch": false, "af_mode": "continuous-video", "exposure_comp": 0.0,
-  "encoder": "c2.mtk.avc.encoder", "bitrate_range": [250000, 40000000]
+  "encoder": "c2.mtk.avc.encoder", "bitrate_range": [250000, 40000000],
+  "audio": false, "mic": "voice", "audio_codec": null, "audio_error": null, "audio_permission": true
 }
 ```
 
@@ -237,9 +240,21 @@ The phone sends `STATS` at 1 Hz while streaming:
 `pipeline_ms` = sensor timestamp → encoded frame; `capture_ms` = sensor timestamp → capture
 result; `encode_ms` ≈ their difference (docs/latency.md).
 
-### 0x40 AUDIO
+### 0x41 AUDIO_CONFIG / 0x40 AUDIO
 
-Reserved for phase 7. Receivers that don't implement it skip it like any unknown type.
+Sent on the video connection while the microphone is enabled (`set_audio`). `AUDIO_CONFIG` comes
+first, again on every new video connection and whenever audio restarts:
+
+```json
+{"codec": "opus", "sample_rate": 48000, "channels": 1, "frame_samples": 960,
+ "source": "voice", "csd": "<base64 OpusHead, 19 bytes>"}
+```
+
+`codec` is `opus` (MediaCodec, Android 10+) or `pcm_s16le` (raw little-endian samples, older
+phones). Each `AUDIO` packet carries one frame (20 ms). `pts_us` is the capture time of its first
+sample on the phone clock (§4, from `AudioRecord.getTimestamp(TIMEBASE_BOOTTIME)`). The phone
+sends audio ahead of queued video and never drops it with the video drop policy; audio is capped
+at 1 s of backlog. Receivers that don't implement audio skip both types like unknown types.
 
 ## 4. Clock
 

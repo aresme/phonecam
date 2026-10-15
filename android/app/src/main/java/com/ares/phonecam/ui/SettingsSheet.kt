@@ -123,6 +123,12 @@ fun SettingsSheet(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
+            Label("Microphone (when enabled)")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = state.controls.micVoice, onClick = { engine.setMicVoice(true) }, label = { Text("Voice (noise suppression)") })
+                FilterChip(selected = !state.controls.micVoice, onClick = { engine.setMicVoice(false) }, label = { Text("Raw") })
+            }
+
             HorizontalDivider()
             SwitchRow("Show stats overlay", statsOn, onStatsChange)
             SwitchRow("Keep screen on while streaming", keepScreenOn, onKeepScreenOnChange)

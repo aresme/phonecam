@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QRadioButton,
+    QSpinBox,
     QSplitter,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from phonecam import __version__
 from phonecam.adb import Adb, AdbDevice, AdbError, find_adb
+from phonecam.audio import AudioPipeline, VirtualMic
 from phonecam.client import Stats, StreamClient, Target
 from phonecam.controls import ControlsPanel
 from phonecam.decoder import vaapi_available
@@ -110,6 +112,7 @@ class Bridge(QObject):
     state = Signal(dict)
     stats = Signal(object)
     devices = Signal(list)
+    mic_status = Signal(str)
     phones = Signal(list)
     pairing = Signal(str)
     error = Signal(str)
@@ -174,6 +177,10 @@ class MainWindow(QMainWindow):
         self.vcam = VirtualCamera(self.client.output_slot, self.client.clock, render_placeholder)
         self.settings = QSettings("PhoneCam", "PhoneCam")
         self.power = PerformanceHold()
+        self.vmic = VirtualMic()
+        self.audio = AudioPipeline(self.client.clock)
+        self.client.audio = self.audio
+        self.audio.start()
         self._connected = False
         self._active = False  # user wants a connection (connect pressed, not disconnected)
 
@@ -222,6 +229,9 @@ class MainWindow(QMainWindow):
         self.controls.mirror_changed.connect(self._on_mirror)
         self.bridge.state.connect(self.controls.set_state)
         self.preview.clicked.connect(self._on_preview_clicked)
+        self.bridge.mic_status.connect(self.mic_status.setText)
+        self._on_av_changed()
+        QTimer.singleShot(0, self._init_mic)
         self.bridge.phones.connect(self._on_phones)
         self.bridge.pairing.connect(self._on_pairing)
         self.browser = PhoneBrowser(self.bridge.phones.emit)
@@ -347,8 +357,46 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         vform.addRow(hint)
         lay.addWidget(vc)
+
+        mic = QGroupBox("PhoneCam Mic")
+        mform = QFormLayout(mic)
+        self.mic_status = QLabel("Creating the PhoneCam Mic input…", objectName="muted")
+        self.mic_status.setWordWrap(True)
+        mform.addRow(self.mic_status)
+        self.av_auto = QCheckBox("A/V sync: match the video delay")
+        self.av_auto.setChecked(self.settings.value("audio/auto", True, bool))
+        mform.addRow(self.av_auto)
+        self.av_delay = QSpinBox()
+        self.av_delay.setRange(0, 600)
+        self.av_delay.setSuffix(" ms")
+        self.av_delay.setValue(int(self.settings.value("audio/delay", 120)))
+        self.av_delay.setEnabled(not self.av_auto.isChecked())
+        mform.addRow("Audio delay", self.av_delay)
+        self.av_auto.toggled.connect(self._on_av_changed)
+        self.av_delay.valueChanged.connect(self._on_av_changed)
+        lay.addWidget(mic)
         lay.addStretch(1)
         return panel
+
+    def _on_av_changed(self, *_: object) -> None:
+        self.av_delay.setEnabled(not self.av_auto.isChecked())
+        self.audio.auto = self.av_auto.isChecked()
+        self.audio.manual_ms = float(self.av_delay.value())
+        self.settings.setValue("audio/auto", self.audio.auto)
+        self.settings.setValue("audio/delay", self.av_delay.value())
+
+    def _init_mic(self) -> None:
+        vmic = self.vmic
+
+        def work() -> None:
+            ok = vmic.create()
+            self.bridge.mic_status.emit(
+                "Select “PhoneCam Mic” as the microphone in Meet/Zoom/OBS."
+                if ok
+                else f"PhoneCam Mic unavailable: {vmic.error}"
+            )
+
+        run_bg(work, "vmic")
 
     # ------------------------------------------------------------------ virtual camera
 
@@ -444,7 +492,17 @@ class MainWindow(QMainWindow):
             return
         st = self.vcam.stats()
         lat = f"{st.latency_ms:.0f} ms" if st.latency_ms is not None else "—"
-        self.vcam_label.setText(f"  ·  v4l2 {st.fps:.0f} fps ({st.showing}) · capture→v4l2 {lat}")
+        text = f"  ·  v4l2 {st.fps:.0f} fps ({st.showing}) · capture→v4l2 {lat}"
+        if st.latency_ms is not None:
+            v = self.audio.video_latency_ms
+            self.audio.video_latency_ms = (
+                st.latency_ms if v is None else 0.8 * v + 0.2 * st.latency_ms
+            )
+        a = self.audio.stats()
+        if a.active:
+            alat = f"{a.latency_ms:.0f}" if a.latency_ms is not None else "—"
+            text += f" · mic {a.codec} {alat} ms (target {a.target_ms:.0f}, late {a.late_dropped})"
+        self.vcam_label.setText(text)
 
     # ------------------------------------------------------------------ settings
 
@@ -784,6 +842,8 @@ class MainWindow(QMainWindow):
         if self.tray is not None:
             self.tray.hide()
         self.browser.stop()
+        self.audio.stop()
+        self.vmic.remove()
         self.vcam_timer.stop()
         self.power.release()
         if self.adb_monitor:

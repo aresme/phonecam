@@ -84,6 +84,22 @@ PC connection alive, shows "Camera in use by another app — waiting", retries w
 free again. Camera open and session configuration are bounded by 5 s timeouts, so a lost callback
 can't wedge the reconciler.
 
+### Audio
+
+Phone: `AudioStreamer` (own thread) reads 20 ms frames from `AudioRecord` (48 kHz mono;
+VOICE_COMMUNICATION or CAMCORDER source), timestamps them on CLOCK_BOOTTIME, encodes Opus with
+MediaCodec (PCM before Android 10) and hands them to the sinks. `VideoClient` has a separate
+audio lane that is sent before video. The foreground service adds the `microphone` type when the
+permission is granted.
+
+PC: the network thread passes `AUDIO`/`AUDIO_CONFIG` to `AudioPipeline` (own thread): decode
+(PyAV Opus), resample to s16, then write each frame at *capture time + target* into the FIFO of
+a PipeWire `module-pipe-source` ("PhoneCam Mic"). The FIFO is shrunk to 4 KB, and PipeWire plays
+silence when it runs dry. The target is the video's capture → v4l2 latency (auto A/V sync) or a
+manual delay, but never below the measured audio arrival latency + 25 ms. Frames that arrive later
+than 60 ms past their slot are dropped, which absorbs clock drift between the phone ADC and the
+PC.
+
 ### Drop policy
 
 `encoder → queue(2) → socket`. When the queue is full, a non-key frame is dropped and a sync

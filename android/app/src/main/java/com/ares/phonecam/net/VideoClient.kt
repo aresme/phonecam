@@ -36,6 +36,10 @@ class VideoClient(
 
     override fun onConfig(csd: ByteArray) = queue.offerConfig(csd)
 
+    override fun onAudioConfig(json: String) = queue.offerAudioConfig(json)
+
+    override fun onAudio(data: ByteArray, ptsUs: Long) = queue.offerAudio(data, ptsUs)
+
     override fun onFrame(data: ByteArray, ptsUs: Long, keyframe: Boolean, extraFlags: Int) {
         if (queue.offerFrame(data, ptsUs, keyframe, extraFlags)) {
             Log.d(TAG, "video queue full for $remote; dropping until next keyframe")
@@ -48,6 +52,8 @@ class VideoClient(
             while (true) {
                 when (val item = queue.take() ?: break) {
                     is FrameQueue.Config -> writer.write(PacketType.CONFIG, item.csd)
+                    is FrameQueue.AudioConfig -> writer.write(PacketType.AUDIO_CONFIG, item.json.toByteArray())
+                    is FrameQueue.Audio -> writer.write(PacketType.AUDIO, item.data, ptsUs = item.ptsUs)
                     is FrameQueue.Frame -> {
                         val flags = (if (item.key) Protocol.FLAG_KEYFRAME else 0) or item.extraFlags
                         writer.write(PacketType.VIDEO, item.data, flags = flags, ptsUs = item.ptsUs)

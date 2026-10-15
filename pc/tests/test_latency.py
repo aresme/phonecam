@@ -42,3 +42,19 @@ def test_ignores_too_late() -> None:
     t, _ = feed(det, t, 10, 20.0)  # 330 ms: give up
     _, found = feed(det, t, 5, 200.0)
     assert found is None
+
+
+def test_audio_onset_detector() -> None:
+    from phonecam.latency_test import AudioOnsetDetector
+
+    det = AudioOnsetDetector()
+    t = 0
+    for _ in range(50):
+        det.sample(t, 100.0)
+        t += 10_000
+    det.beep(t)
+    for _ in range(8):  # 80 ms of quiet after the beep was played
+        assert det.sample(t, 120.0) is None
+        t += 10_000
+    d = det.sample(t, 5000.0)
+    assert d is not None and 75 < d < 85

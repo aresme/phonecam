@@ -12,9 +12,13 @@ class FrameQueue(private val maxFrames: Int = 2) {
     sealed interface Item
     class Config(val csd: ByteArray) : Item
     class Frame(val data: ByteArray, val ptsUs: Long, val key: Boolean, val extraFlags: Int = 0) : Item
+    class AudioConfig(val json: String) : Item
+    class Audio(val data: ByteArray, val ptsUs: Long) : Item
 
     private val lock = Object()
     private val queue = ArrayDeque<Item>()
+    /** Audio lane: small, latency-critical, never dropped with video; capped at ~1 s. */
+    private val audio = ArrayDeque<Item>()
     private var frames = 0
     private var waitingForKey = true
     private var closed = false
@@ -54,16 +58,43 @@ class FrameQueue(private val maxFrames: Int = 2) {
         return false
     }
 
-    /** Blocks until an item is available; null once closed. */
+    var audioDropped = 0L
+        private set
+
+    fun offerAudioConfig(json: String) = synchronized(lock) {
+        if (closed) return
+        audio.clear()
+        audio.addLast(AudioConfig(json))
+        lock.notifyAll()
+    }
+
+    fun offerAudio(data: ByteArray, ptsUs: Long) = synchronized(lock) {
+        if (closed) return
+        if (audio.size >= MAX_AUDIO) {
+            val i = audio.indexOfFirst { it is Audio }
+            if (i >= 0) audio.removeAt(i)
+            audioDropped++
+        }
+        audio.addLast(Audio(data, ptsUs))
+        lock.notifyAll()
+    }
+
+    /** Blocks until an item is available (audio first); null once closed. */
     fun take(): Item? = synchronized(lock) {
-        while (queue.isEmpty() && !closed) lock.wait()
+        while (queue.isEmpty() && audio.isEmpty() && !closed) lock.wait()
         if (closed) return null
+        if (audio.isNotEmpty()) return audio.removeFirst()
         queue.removeFirst().also { if (it is Frame) frames-- }
     }
 
     fun close() = synchronized(lock) {
         closed = true
         queue.clear()
+        audio.clear()
         lock.notifyAll()
+    }
+
+    companion object {
+        const val MAX_AUDIO = 50 // 50 x 20 ms
     }
 }

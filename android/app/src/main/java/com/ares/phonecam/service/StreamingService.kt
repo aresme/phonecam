@@ -51,6 +51,11 @@ class StreamingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_REFRESH) {
+            // Microphone permission was just granted: add the microphone FGS type.
+            if (wakeLock != null) ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), foregroundType())
+            return START_NOT_STICKY
+        }
         if (intent?.action == ACTION_STOP) {
             Log.i(TAG, "stop requested")
             engine.stopStreaming()
@@ -107,8 +112,12 @@ class StreamingService : Service() {
         super.onDestroy()
     }
 
-    private fun foregroundType(): Int =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0
+    private fun foregroundType(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return 0
+        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        if (engine.hasMicPermission()) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        return type
+    }
 
     private fun buildNotification(): Notification {
         val nm = getSystemService(NotificationManager::class.java)
@@ -136,12 +145,18 @@ class StreamingService : Service() {
         private const val CHANNEL_ID = "streaming"
         private const val NOTIFICATION_ID = 1
         private const val ACTION_STOP = "com.ares.phonecam.STOP"
+        private const val ACTION_REFRESH = "com.ares.phonecam.REFRESH"
         private const val EXTRA_RECORD = "record"
 
         fun start(context: Context, record: Boolean) {
             ContextCompat.startForegroundService(
                 context, Intent(context, StreamingService::class.java).putExtra(EXTRA_RECORD, record),
             )
+        }
+
+        /** Re-declare the foreground types (e.g. after the microphone permission was granted). */
+        fun refresh(context: Context) {
+            context.startService(Intent(context, StreamingService::class.java).setAction(ACTION_REFRESH))
         }
 
         fun stop(context: Context) {

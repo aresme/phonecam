@@ -12,6 +12,8 @@ class FrameQueueTest {
     private fun describe(i: FrameQueue.Item) = when (i) {
         is FrameQueue.Config -> "C"
         is FrameQueue.Frame -> (if (i.key) "K" else "P") + i.data[0]
+        is FrameQueue.AudioConfig -> "AC"
+        is FrameQueue.Audio -> "A" + i.data[0]
     }
 
     @Test
@@ -63,5 +65,27 @@ class FrameQueueTest {
         q.close()
         t.join(1000)
         assertNull(result)
+    }
+
+    @Test
+    fun audioGoesFirstAndSurvivesVideoDrops() {
+        val q = FrameQueue(2)
+        q.offerConfig(b(0))
+        q.offerFrame(b(1), 1, true)
+        q.offerFrame(b(2), 2, false)
+        q.offerFrame(b(3), 3, false) // video full -> dropped
+        q.offerAudioConfig("{}")
+        q.offerAudio(b(7), 7)
+        assertEquals("AC", describe(q.take()!!))
+        assertEquals("A7", describe(q.take()!!))
+        assertEquals("C", describe(q.take()!!))
+    }
+
+    @Test
+    fun audioLaneIsBounded() {
+        val q = FrameQueue(2)
+        repeat(FrameQueue.MAX_AUDIO + 5) { q.offerAudio(b(it), it.toLong()) }
+        assertEquals(5, q.audioDropped)
+        assertEquals("A5", describe(q.take()!!)) // the oldest 5 were dropped
     }
 }

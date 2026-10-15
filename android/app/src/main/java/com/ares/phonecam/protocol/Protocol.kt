@@ -30,8 +30,9 @@ object PacketType {
     const val PONG = 0x21
     const val STATS = 0x30
     const val AUDIO = 0x40
+    const val AUDIO_CONFIG = 0x41
 
-    private val known = setOf(HELLO, CONFIG, VIDEO, CONTROL_REQ, CONTROL_RES, STATE, PING, PONG, STATS, AUDIO)
+    private val known = setOf(HELLO, CONFIG, VIDEO, CONTROL_REQ, CONTROL_RES, STATE, PING, PONG, STATS, AUDIO, AUDIO_CONFIG)
     fun isKnown(type: Int) = type in known
 }
 

@@ -125,6 +125,19 @@ Everything can be changed from either side, and both UIs stay in sync:
 The video is not encrypted. The pairing code only keeps other people on the same network from
 watching or taking over the stream. Use Wi-Fi mode on networks you trust.
 
+### Microphone (PhoneCam Mic)
+
+The phone's microphone can be streamed too. It is off by default.
+
+1. On the phone, tap the 🎤 button once and allow the microphone. After that the mic can be
+   switched from either side; on the PC it's *Stream phone microphone* in the camera panel.
+2. In Meet/Zoom/OBS choose the microphone **PhoneCam Mic**. It exists while the PC app runs
+   (silent when the phone mic is off).
+3. *Mic mode*: **Voice** uses the phone's call processing (echo cancellation, noise suppression).
+   **Raw** is the unprocessed mic.
+4. *A/V sync*: by default the audio is delayed to match the video delay. Untick it to set a fixed
+   delay. Check sync with **Latency test… → A** (flash + beep).
+
 ### Tray icon
 
 With a tray (Ubuntu's AppIndicator extension, enabled by default), closing the window keeps

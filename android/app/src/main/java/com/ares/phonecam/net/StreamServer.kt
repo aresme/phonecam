@@ -273,6 +273,10 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
                     ?: throw IllegalArgumentException("orientation must be landscape, portrait or auto"))
                 "request_keyframe" -> engine.requestKeyframe()
                 "set_tuning" -> engine.setTuning(args) // experimental, for latency measurements
+                "set_audio" -> {
+                    if (args.has("mic")) engine.setMicVoice(args.getString("mic") != "raw")
+                    if (args.has("enabled")) engine.setAudio(args.getBoolean("enabled"))
+                }
                 "get_status" -> Unit
                 else -> throw IllegalArgumentException("unknown command: $cmd")
             }
@@ -319,6 +323,11 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
             .put("af_mode", st.controls.afMode)
             .put("exposure_comp", st.camera?.evForIndex(st.controls.aeCompIndex)?.toDouble() ?: 0.0)
             .put("encoder", st.encoderName)
+            .put("audio", st.controls.audio)
+            .put("mic", if (st.controls.micVoice) "voice" else "raw")
+            .put("audio_codec", st.audioCodec)
+            .put("audio_error", st.audioError)
+            .put("audio_permission", engine.hasMicPermission())
             .put("bitrate_range", JSONArray(listOf(com.ares.phonecam.engine.MIN_BITRATE, com.ares.phonecam.engine.MAX_BITRATE)))
     }
 

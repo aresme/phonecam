@@ -32,6 +32,7 @@ class PacketType(enum.IntEnum):
     PONG = 0x21
     STATS = 0x30
     AUDIO = 0x40
+    AUDIO_CONFIG = 0x41
 
 
 class ProtocolError(Exception):

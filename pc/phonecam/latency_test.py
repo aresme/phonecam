@@ -13,6 +13,7 @@ Point the phone at this window. Two measurements:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import statistics
 import threading
@@ -22,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 import av
+import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
@@ -94,6 +96,149 @@ class FlashDetector:
         return self.levels() is not None
 
 
+class AudioOnsetDetector:
+    """Finds the first loud 10 ms block after each beep, relative to a quiet baseline."""
+
+    def __init__(
+        self, factor: float = 6.0, min_rms: float = 400.0, max_delay_ms: float = 1000.0
+    ) -> None:
+        self.factor = factor
+        self.min_rms = min_rms
+        self.max_delay_us = max_delay_ms * 1000
+        self._quiet: deque[float] = deque(maxlen=100)
+        self._beep_t: int | None = None
+        self.results: list[float] = []
+
+    def beep(self, t_us: int) -> None:
+        self._beep_t = t_us
+
+    def sample(self, t_us: int, rms: float) -> float | None:
+        if self._beep_t is None or t_us < self._beep_t:
+            self._quiet.append(rms)
+            return None
+        if t_us - self._beep_t > self.max_delay_us:
+            self._beep_t = None
+            return None
+        base = statistics.median(self._quiet) if self._quiet else 0.0
+        if rms > max(base * self.factor, base + self.min_rms):
+            delay = (t_us - self._beep_t) / 1000
+            self._beep_t = None
+            self.results.append(delay)
+            return delay
+        return None
+
+
+class Beeper:
+    """Continuous playback stream (pw-cat) into which short beeps are injected on demand.
+    A 4 KB stdin pipe keeps the backlog ~42 ms so the beep plays right when it's written."""
+
+    RATE = 48_000
+
+    def __init__(self) -> None:
+        import fcntl
+        import subprocess
+
+        self._proc = subprocess.Popen(
+            [
+                "pw-cat",
+                "--playback",
+                "--rate",
+                "48000",
+                "--channels",
+                "1",
+                "--format",
+                "s16",
+                "--latency",
+                "10ms",
+                "-",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        assert self._proc.stdin is not None
+        with contextlib.suppress(OSError):
+            fcntl.fcntl(self._proc.stdin.fileno(), 1031, 4096)  # F_SETPIPE_SZ
+        t = np.arange(int(self.RATE * 0.06)) / self.RATE
+        self._beep = (np.sin(2 * np.pi * 1000 * t) * 16000).astype("<i2").tobytes()
+        self._silence = bytes(self.RATE // 100 * 2)  # 10 ms
+        self._pending = False
+        self.on_beep = lambda t_us: None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="beeper", daemon=True)
+        self._thread.start()
+
+    def beep(self) -> None:
+        self._pending = True
+
+    def _run(self) -> None:
+        out = self._proc.stdin
+        assert out is not None
+        try:
+            while not self._stop.is_set():
+                if self._pending:
+                    self._pending = False
+                    self.on_beep(now_us())
+                    out.write(self._beep)
+                else:
+                    out.write(self._silence)
+                out.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def close(self) -> None:
+        self._stop.set()
+        with contextlib.suppress(Exception):
+            self._proc.terminate()
+
+
+class MicReader(QObject):
+    """Reads the PhoneCam Mic source like a call app would (pw-record), 10 ms RMS blocks."""
+
+    rms = Signal(object, float)
+    error = Signal(str)
+
+    def __init__(self, source: str = "phonecam_mic") -> None:
+        super().__init__()
+        import subprocess
+
+        self._proc = subprocess.Popen(
+            [
+                "pw-record",
+                "--target",
+                source,
+                "--rate",
+                "48000",
+                "--channels",
+                "1",
+                "--format",
+                "s16",
+                "--latency",
+                "10ms",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        self._thread = threading.Thread(target=self._run, name="mic-reader", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        out = self._proc.stdout
+        assert out is not None
+        block = 480 * 2
+        while True:
+            data = out.read(block)
+            if not data or len(data) < block:
+                break
+            a = np.frombuffer(data, "<i2").astype(np.float32)
+            self.rms.emit(now_us(), float(np.sqrt(np.mean(a * a))))
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._proc.terminate()
+
+
 class V4L2Reader(QObject):
     """Reads the virtual camera like a consumer app; emits preview images and luma samples."""
 
@@ -150,6 +295,10 @@ class LatencyWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setCursor(Qt.CursorShape.BlankCursor)
         self.detector = FlashDetector()
+        self.audio_detector = AudioOnsetDetector()
+        self.av_mode = False
+        self._beeper: Beeper | None = None
+        self._mic: MicReader | None = None
         self.flash = False
         self.white = False
         self.camera_image: QImage | None = None
@@ -191,8 +340,30 @@ class LatencyWindow(QWidget):
 
     def _flip(self) -> None:
         self.white = not self.white
+        if self.av_mode and self.white and self._beeper is not None:
+            self._beeper.beep()  # the beep thread timestamps the moment it writes the samples
         self.repaint()  # synchronous paint, then timestamp
         self.detector.flip(now_us(), self.white)
+
+    def _start_av(self) -> None:
+        """Flash test plus a beep on every flip to white, heard through PhoneCam Mic."""
+        try:
+            self._beeper = Beeper()
+            self._mic = MicReader()
+        except OSError as e:
+            self.message = f"A/V test unavailable: {e}"
+            return
+        self._beeper.on_beep = self.audio_detector.beep
+        self._mic.rms.connect(lambda t, r: self.audio_detector.sample(t, r))
+        self.audio_detector.results.clear()
+        self.av_mode = True
+
+    def _stop_av(self) -> None:
+        self.av_mode = False
+        for obj in (self._beeper, self._mic):
+            if obj is not None:
+                obj.close()
+        self._beeper = self._mic = None
 
     def keyPressEvent(self, e: QKeyEvent) -> None:
         if e.key() == Qt.Key.Key_Escape:
@@ -205,6 +376,17 @@ class LatencyWindow(QWidget):
             else:
                 self._flipper.stop()
                 self.white = False
+        elif e.key() == Qt.Key.Key_A:
+            if self.av_mode:
+                self._stop_av()
+                self._flipper.stop()
+                self.flash = False
+                self.white = False
+            else:
+                self._start_av()
+                self.flash = True
+                self.detector.results.clear()
+                self._flipper.start()
         elif e.key() == Qt.Key.Key_Space:
             self._snapshot()
 
@@ -218,6 +400,7 @@ class LatencyWindow(QWidget):
         log.info("latency snapshot %s", path)
 
     def closeEvent(self, event) -> None:
+        self._stop_av()
         self._tick.stop()
         self._flipper.stop()
         self.reader.stop()
@@ -267,8 +450,20 @@ class LatencyWindow(QWidget):
             flash_line = (
                 "F: start the automatic flash test (alternates black/white once per second)"
             )
+        av_line = "A: A/V sync test (flash + beep; needs the phone mic streaming to PhoneCam Mic)"
+        ares = self.audio_detector.results[-30:]
+        if self.av_mode and ares and res:
+            av_line = (
+                f"A/V test: audio median {statistics.median(ares):.0f} ms, video median "
+                f"{statistics.median(res):.0f} ms → audio is "
+                f"{statistics.median(ares) - statistics.median(res):+.0f} ms vs video "
+                f"(n={len(ares)})"
+            )
+        elif self.av_mode:
+            av_line = "A/V test: listening for the beep on PhoneCam Mic…"
         return [
             flash_line,
+            av_line,
             "Space: snapshot to ~/Pictures/PhoneCam "
             "(latency = timer at capture - timer seen in the camera picture)",
             "Esc: close",

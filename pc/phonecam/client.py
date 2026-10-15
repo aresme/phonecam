@@ -120,6 +120,7 @@ class StreamClient:
         # One slot per consumer: GUI preview, and (phase 3) the virtual camera output.
         self.preview_slot: LatestFrameSlot[DecodedFrame] = LatestFrameSlot()
         self.output_slot: LatestFrameSlot[DecodedFrame] = LatestFrameSlot()
+        self.audio: Any = None  # AudioPipeline (submit/submit_config), set by the app
         self._target: Target | None = None
         self._stop = threading.Event()
         self._supervisor: threading.Thread | None = None
@@ -304,7 +305,11 @@ class StreamClient:
                     except queue.Full:
                         if session_stop.is_set() or self._stop.is_set():
                             return
-            # other types (AUDIO later, unknown) are skipped
+            elif p.type == PacketType.AUDIO and self.audio is not None:
+                self.audio.submit(p.payload, p.pts_us)
+            elif p.type == PacketType.AUDIO_CONFIG and self.audio is not None:
+                self.audio.submit_config(p.payload)
+            # other/unknown types are skipped
 
     # ------------------------------------------------------------------ decode
 

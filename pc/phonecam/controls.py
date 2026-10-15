@@ -102,6 +102,14 @@ class ControlsPanel(QGroupBox):
             self.orientation.addItem(label, key)
         form.addRow("Orientation", self.orientation)
 
+        self.mic = QCheckBox("Stream phone microphone")
+        self.mic.setToolTip("Sends the phone's mic to the PhoneCam Mic input on this PC")
+        self.mic_source = QComboBox()
+        self.mic_source.addItem("Voice (noise suppression)", "voice")
+        self.mic_source.addItem("Raw", "raw")
+        form.addRow(self.mic)
+        form.addRow("Mic mode", self.mic_source)
+
         self.mirror = QCheckBox("Mirror output (PC side)")
         self.mirror.setToolTip("Flip the video horizontally before it reaches the virtual camera")
         form.addRow(self.mirror)
@@ -123,6 +131,10 @@ class ControlsPanel(QGroupBox):
             lambda _: self._send("set_orientation", orientation=self.orientation.currentData())
         )
         self.mirror.toggled.connect(self.mirror_changed)
+        self.mic.clicked.connect(lambda on: self._send("set_audio", enabled=on))
+        self.mic_source.activated.connect(
+            lambda _: self._send("set_audio", mic=self.mic_source.currentData())
+        )
         self.set_connected(False)
 
     # ------------------------------------------------------------------ inbound
@@ -139,6 +151,8 @@ class ControlsPanel(QGroupBox):
             self.af,
             self.exposure,
             self.orientation,
+            self.mic,
+            self.mic_source,
         ):
             w.setEnabled(connected)
         if connected:
@@ -216,6 +230,19 @@ class ControlsPanel(QGroupBox):
 
         with _Blocked(self.orientation):
             self.orientation.setCurrentIndex(self.orientation.findData(st.get("orientation")))
+
+        with _Blocked(self.mic):
+            self.mic.setChecked(bool(st.get("audio")))
+        with _Blocked(self.mic_source):
+            self.mic_source.setCurrentIndex(self.mic_source.findData(st.get("mic", "voice")))
+        allowed = bool(st.get("audio_permission", True))
+        self.mic.setEnabled(self._connected and allowed)
+        if st.get("audio_error"):
+            self.mic.setToolTip(str(st["audio_error"]))
+        elif not allowed:
+            self.mic.setToolTip("Allow the microphone once in the phone app (tap its mic button)")
+        else:
+            self.mic.setToolTip("Sends the phone's mic to the PhoneCam Mic input on this PC")
 
     def _send(self, cmd: str, **args: Any) -> None:
         self.request.emit(cmd, args)

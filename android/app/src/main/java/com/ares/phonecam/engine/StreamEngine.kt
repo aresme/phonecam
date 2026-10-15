@@ -13,6 +13,7 @@ import android.util.Size
 import android.view.OrientationEventListener
 import android.view.Surface
 import com.ares.phonecam.TAG
+import com.ares.phonecam.audio.AudioStreamer
 import com.ares.phonecam.camera.CameraCatalog
 import com.ares.phonecam.camera.CameraController
 import com.ares.phonecam.camera.CameraInfo
@@ -74,6 +75,10 @@ data class Controls(
     val focusPoint: Pair<Float, Float>? = null,
     /** Incremented to request a new one-shot AF scan. */
     val focusSeq: Int = 0,
+    /** Stream the microphone (needs RECORD_AUDIO). */
+    val audio: Boolean = false,
+    /** Voice-communication source (echo cancellation/noise suppression) vs raw camcorder mic. */
+    val micVoice: Boolean = true,
 )
 
 const val MIN_BITRATE = 250_000
@@ -106,6 +111,8 @@ data class EngineState(
     val lastRecording: File? = null,
     val error: String? = null,
     val stats: EngineStats = EngineStats(),
+    val audioCodec: String? = null,
+    val audioError: String? = null,
 ) {
     val camera: CameraInfo? get() = cameras.firstOrNull { it.id == config?.cameraId }
 }
@@ -183,6 +190,51 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
         }
     }
 
+    // ---- audio ----
+    @Volatile private var audioStreamer: AudioStreamer? = null
+    private var audioVoice = true
+    @Volatile private var lastAudioConfig: String? = null
+
+    private val audioListener = object : AudioStreamer.Listener {
+        override fun onAudioConfig(json: String) {
+            lastAudioConfig = json
+            sinks.forEach { it.onAudioConfig(json) }
+        }
+
+        override fun onAudio(data: ByteArray, ptsUs: Long) = sinks.forEach { it.onAudio(data, ptsUs) }
+
+        override fun onAudioError(message: String) = _state.update { it.copy(audioError = message) }
+    }
+
+    fun hasMicPermission() = androidx.core.content.ContextCompat.checkSelfPermission(
+        appContext, android.Manifest.permission.RECORD_AUDIO,
+    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    fun setAudio(enabled: Boolean) {
+        require(!enabled || hasMicPermission()) { "microphone permission not granted on the phone (enable the mic in the phone app once)" }
+        mutate { d -> d.copy(controls = d.controls.copy(audio = enabled)) }
+    }
+
+    fun setMicVoice(voice: Boolean) = mutate { d -> d.copy(controls = d.controls.copy(micVoice = voice)) }
+
+    /** Start/stop/restart the microphone to match the desired state (camera-independent). */
+    private fun reconcileAudio(d: Desired) {
+        val want = d.streaming && d.controls.audio && hasMicPermission()
+        val cur = audioStreamer
+        if (cur != null && (!want || audioVoice != d.controls.micVoice)) {
+            cur.stop()
+            audioStreamer = null
+            lastAudioConfig = null
+            _state.update { it.copy(audioCodec = null) }
+        }
+        if (want && audioStreamer == null) {
+            audioVoice = d.controls.micVoice
+            _state.update { it.copy(audioError = null) }
+            audioStreamer = AudioStreamer(audioListener, audioVoice).also { it.start() }
+            _state.update { it.copy(audioCodec = if (android.os.Build.VERSION.SDK_INT >= 29) "opus" else "pcm_s16le") }
+        }
+    }
+
     // ---- shared with the encoder thread ----
     private val sinks = CopyOnWriteArrayList<FrameSink>()
     @Volatile private var lastCsd: ByteArray? = null
@@ -191,17 +243,6 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
     private val latencySumUs = AtomicLong()
     private val latencyMaxUs = AtomicLong()
 
-    init {
-        scope.launch { loadCameras() }
-        scope.launch { desired.collect { d -> mutex.withLock { applySafely(d) } } }
-        scope.launch { statsLoop() }
-        scope.launch {
-            // Persist the last-used stream settings (debounced; skips the initial value).
-            desired.map { d -> d.config?.let { it to d.controls.orientation.wire } }
-                .filterNotNull().distinctUntilChanged().drop(1).debounce(500)
-                .collect { (cfg, orient) -> settings.saveStream(cfg, orient) }
-        }
-    }
 
     // ------------------------------------------------------------------ public API (any thread)
 
@@ -375,6 +416,7 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
     fun addSink(sink: FrameSink) {
         sinks += sink
         lastCsd?.let { sink.onConfig(it) }
+        lastAudioConfig?.let { sink.onAudioConfig(it) }
         encoder?.requestKeyframe()
     }
 
@@ -434,6 +476,7 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
         } catch (e: Exception) {
             handleFailure(e)
         }
+        reconcileAudio(d)
         publishState()
     }
 
@@ -683,6 +726,20 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
             if (df > 0) Log.d(TAG, "stats $stats")
             _state.update { it.copy(stats = stats) }
             lastFrames = f; lastBytes = b; lastSum = s; lastT = now
+        }
+    }
+
+    // Last in the class body: these coroutines run on another thread right away, so every
+    // property above must already be initialized (Kotlin initializes in textual order).
+    init {
+        scope.launch { loadCameras() }
+        scope.launch { desired.collect { d -> mutex.withLock { applySafely(d) } } }
+        scope.launch { statsLoop() }
+        scope.launch {
+            // Persist the last-used stream settings (debounced; skips the initial value).
+            desired.map { d -> d.config?.let { it to d.controls.orientation.wire } }
+                .filterNotNull().distinctUntilChanged().drop(1).debounce(500)
+                .collect { (cfg, orient) -> settings.saveStream(cfg, orient) }
         }
     }
 }

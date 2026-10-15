@@ -1,5 +1,7 @@
 package com.ares.phonecam.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -152,7 +154,18 @@ fun MainScreen(engine: StreamEngine, server: StreamServer, settings: SettingsRep
             }
         }
 
-        if (cam != null && cfg != null) QuickControls(engine, state, previewOn) { previewOn = it }
+        val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                runCatching { engine.setAudio(true) }
+                if (state.streaming) StreamingService.refresh(context)
+            }
+        }
+        if (cam != null && cfg != null) {
+            QuickControls(engine, state, previewOn, onPreview = { previewOn = it }, onMic = { on ->
+                if (on && !engine.hasMicPermission()) micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                else runCatching { engine.setAudio(on) }
+            })
+        }
 
         if (cfg != null) {
             val enc = state.encoderName?.let { " · $it${if (state.encoderHardware) " (HW)" else " (SW)"}" } ?: ""
@@ -174,6 +187,7 @@ fun MainScreen(engine: StreamEngine, server: StreamServer, settings: SettingsRep
             Text("Recording: ${it.name}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        state.audioError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
 
         Button(
             onClick = {
@@ -247,7 +261,13 @@ private fun WifiInfo(addresses: List<LocalAddress>, pairing: String?, requirePai
 }
 
 @Composable
-private fun QuickControls(engine: StreamEngine, state: EngineState, previewOn: Boolean, onPreview: (Boolean) -> Unit) {
+private fun QuickControls(
+    engine: StreamEngine,
+    state: EngineState,
+    previewOn: Boolean,
+    onPreview: (Boolean) -> Unit,
+    onMic: (Boolean) -> Unit,
+) {
     val cam = state.camera ?: return
     val c = state.controls
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -260,6 +280,9 @@ private fun QuickControls(engine: StreamEngine, state: EngineState, previewOn: B
             enabled = cam.hasFlash,
         ) {
             Icon(painterResource(R.drawable.ic_flash), contentDescription = "Torch")
+        }
+        FilledIconToggleButton(checked = c.audio, onCheckedChange = onMic) {
+            Icon(painterResource(R.drawable.ic_mic), contentDescription = "Microphone")
         }
         if ("auto" in cam.afModeNames) {
             val locked = c.afMode == "locked"

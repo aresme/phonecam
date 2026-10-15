@@ -8,6 +8,7 @@ Targets: **< 150 ms** glass-to-glass over USB, **< 250 ms** over Wi-Fi.
 |---|---|
 | Capture → written to `/dev/video10` (computed from timestamps) | **107–114 ms** |
 | Screen flip → frame read from `/dev/video10` (automatic flash test, n=64) | **median 170–175 ms**, best 129–134 ms |
+| Same over **Wi-Fi** (phone hotspot, n=29) | **median 187 ms**, best 137 ms (target < 250 ms ✓) |
 | Timer snapshots (timer seen through the camera vs. timer at capture) | 165–195 ms |
 
 Most of the delay happens **inside the phone's camera HAL**: 85–95 ms from the start of
@@ -95,6 +96,15 @@ rule out HAL extras), **Main profile without B-frames** (smallest stream, fastes
 VAAPI-compatible), **`KEY_OPERATING_RATE` = max** (−3 to 4 ms encode), `KEY_PRIORITY` 0,
 `KEY_LATENCY` 1. PC: software decode, CPU boost on, I420 output.
 
+## Wi-Fi
+
+Measured with the phone's own hotspot. The office network ("KABU") isolates clients, so phone ↔
+PC traffic is blocked there, although mDNS discovery still works. Over Wi-Fi the PC received
+frames ~82 ms after capture (USB: ~98 ms in that session; the phone pipeline happened to be
+faster in that run, 77 ms). The flash test median was 187 ms, about 12 ms above USB. RTT is 2–4 ms
+with occasional spikes to ~100 ms. The phone's drop-to-keyframe queue keeps those from
+accumulating. The phone holds a low-latency Wi-Fi lock while streaming.
+
 ## Device limit
 
 The remaining ~90 ms is the camera HAL: about 30 ms of exposure, then readout and MediaTek ISP
@@ -117,3 +127,4 @@ phone:
 | 2026-10-15 | Infinix X6886 (MT6789) | USB | 1280×720 | 30 | 6 Mbit/s | Main | software, balanced power | 114.5 | — | tuned phone, no CPU boost (decode 14 ms) |
 | 2026-10-15 | Infinix X6886 (MT6789) | USB | 1280×720 | 30 | 6 Mbit/s | Main | VAAPI | 122 | — | decode 8.9 ms + GPU download |
 | 2026-10-15 | Infinix X6886 (MT6789) | USB | 1280×720 | 30 | 6 Mbit/s | Main | software + CPU boost | **107.5–114** | **170 / 175** (best 129) | final phase-5 defaults; timer snapshots 165–195 ms |
+| 2026-10-15 | Infinix X6886 (MT6789) | Wi-Fi (phone hotspot, RSSI ~−40) | 1280×720 | 30 | 6 Mbit/s | Main | software, no boost | 96–98 capture→decoded (max 170); RTT 4 ms (max 103) | **187** (best 137) | phase 6; same pipeline + ~12 ms vs USB |

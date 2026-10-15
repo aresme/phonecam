@@ -93,10 +93,13 @@ audio lane that is sent before video. The foreground service adds the `microphon
 permission is granted.
 
 PC: the network thread passes `AUDIO`/`AUDIO_CONFIG` to `AudioPipeline` (own thread): decode
-(PyAV Opus), resample to s16, then write each frame at *capture time + target* into the FIFO of
-a PipeWire `module-pipe-source` ("PhoneCam Mic"). The FIFO is shrunk to 4 KB, and PipeWire plays
-silence when it runs dry. The target is the video's capture → v4l2 latency (auto A/V sync) or a
-manual delay, but never below the measured audio arrival latency + 25 ms. Frames that arrive later
+(PyAV Opus), resample to s16, then write each frame at *capture time + target* into a persistent
+`pw-cat` stream (20 ms latency, 4 KB stdin pipe). That stream is linked with `pw-link` to
+"PhoneCam Mic", a null sink with `media.class=Audio/Source/Virtual` (module-pipe-source was
+3–6× slower). PipeWire plays silence when nothing is written. In auto A/V sync the target is
+the video's capture → v4l2 latency minus the ~30 ms output stage of the virtual source;
+otherwise it's a manual delay. It is never below the audio arrival latency (stamped on receipt)
++ 15 ms. Frames that arrive later
 than 60 ms past their slot are dropped, which absorbs clock drift between the phone ADC and the
 PC.
 

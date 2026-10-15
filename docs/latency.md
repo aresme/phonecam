@@ -105,6 +105,36 @@ faster in that run, 77 ms). The flash test median was 187 ms, about 12 ms above 
 with occasional spikes to ~100 ms. The phone's drop-to-keyframe queue keeps those from
 accumulating. The phone holds a low-latency Wi-Fi lock while streaming.
 
+## Audio and A/V sync (phase 7)
+
+Measured with **Latency test → A**: each flip to white also plays a 60 ms beep on the laptop
+speaker. The phone mic (raw mode) picks it up, and a reader records "PhoneCam Mic" like a call
+app would.
+
+| Iteration | Audio (beep → heard on PhoneCam Mic) | Video (flash) | Audio − video |
+|---|---|---|---|
+| module-pipe-source, arrival stamped after queueing, uncalibrated audio timestamps | 434 ms | 158 ms | +276 ms |
+| + virtual source (null sink, `Audio/Source/Virtual`) fed by pw-cat | 299 ms | 150 ms | +149 ms |
+| + auto target = video − 30 ms output stage, beep timestamp corrected for queued silence | 252 ms | 158 ms | +94 ms |
+| + Opus packet drained right after encoding (arrival 87 → 35 ms) | **252 ms** | **171 ms** | **+81 ms** |
+
+Findings along the way:
+
+- `module-pipe-source` adds 108–180 ms of growing latency. A null sink with
+  `media.class=Audio/Source/Virtual`, fed by a `pw-cat` stream (20 ms) explicitly linked with
+  `pw-link`, adds 13–50 ms.
+- On this MediaTek phone, `AudioRecord.getTimestamp()` frame positions count from when the mic
+  *device* opened, not from our recording start, so timestamps were off by 0.9–51 s. Fix:
+  calibrate the device→stream frame offset once.
+- Arrival must be stamped on receipt; stamping it after the jitter buffer created a runaway
+  feedback loop (target ↔ arrival).
+
+Remaining +81 ms: part of it is the test's own asymmetry (the beep's playback path through
+PipeWire/ALSA is slower than the display), and part is the phone microphone's hardware input
+latency, which Android doesn't expose. Audio lagging video by < ~125 ms is below the usual
+detectability threshold (ITU-R BT.1359), so this is acceptable for calls. Users can't make audio
+*earlier* than its floor (arrival + 15 ms), but can add delay with the manual setting.
+
 ## Device limit
 
 The remaining ~90 ms is the camera HAL: about 30 ms of exposure, then readout and MediaTek ISP

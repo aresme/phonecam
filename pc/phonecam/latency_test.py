@@ -14,8 +14,10 @@ Point the phone at this window. Two measurements:
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import logging
 import statistics
+import termios
 import threading
 import time
 from collections import deque
@@ -142,6 +144,7 @@ class Beeper:
             [
                 "pw-cat",
                 "--playback",
+                "--raw",  # raw samples on stdin (otherwise "-" is parsed as a sound file)
                 "--rate",
                 "48000",
                 "--channels",
@@ -178,7 +181,12 @@ class Beeper:
             while not self._stop.is_set():
                 if self._pending:
                     self._pending = False
-                    self.on_beep(now_us())
+                    # The beep plays after whatever silence is still queued in the pipe.
+                    queued = 0
+                    with contextlib.suppress(OSError):
+                        buf = fcntl.ioctl(out.fileno(), termios.FIONREAD, b"\0\0\0\0")
+                        queued = int.from_bytes(buf, "little")
+                    self.on_beep(now_us() + queued * 1_000_000 // (self.RATE * 2))
                     out.write(self._beep)
                 else:
                     out.write(self._silence)
@@ -190,6 +198,12 @@ class Beeper:
         self._stop.set()
         with contextlib.suppress(Exception):
             self._proc.terminate()
+        with contextlib.suppress(Exception):
+            if self._proc.stdin:
+                self._proc.stdin.close()
+        with contextlib.suppress(Exception):
+            if self._proc.stdin:
+                self._proc.stdin.close()
 
 
 class MicReader(QObject):
@@ -205,6 +219,7 @@ class MicReader(QObject):
         self._proc = subprocess.Popen(
             [
                 "pw-record",
+                "--raw",
                 "--target",
                 source,
                 "--rate",

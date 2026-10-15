@@ -1,31 +1,30 @@
 """Phone microphone → PipeWire virtual source "PhoneCam Mic".
 
-- VirtualMic: `pactl load-module module-pipe-source` reading s16le/48 kHz/mono from a FIFO.
-  PipeWire outputs silence when the FIFO is empty, so apps never stall.
+- VirtualMic: a null sink with `media.class=Audio/Source/Virtual`: a microphone apps can select,
+  with an input port we play into. (module-pipe-source was measured at 108-180 ms of extra,
+  growing latency; this path adds ~13-50 ms. See docs/latency.md.)
+- PwCatSink: a persistent `pw-cat --playback` stream (20 ms node latency, 4 KB stdin pipe so no
+  backlog hides in it), explicitly linked to the virtual source with pw-link. PipeWire plays
+  silence when we don't write, so apps never stall.
 - AudioPipeline: decodes AUDIO packets (Opus via PyAV, or raw PCM) and writes each 20 ms frame
   at *capture time + target latency* (a jitter buffer anchored on the phone's timestamps and the
-  PING/PONG clock offset). That smooths network bursts, sets a fixed audio delay for lip sync
-  with the video, and drops frames that arrive too late. The FIFO is shrunk to 4 KB (~42 ms) so
-  no hidden backlog builds up. Bursts written faster than real time would be trimmed by the
-  pipe source anyway.
+  PING/PONG clock offset). That smooths network bursts, sets the audio delay for lip sync with
+  the video, and drops frames that arrive too late (which also absorbs clock drift).
 """
 
 from __future__ import annotations
 
 import base64
 import contextlib
-import errno
 import fcntl
 import json
 import logging
-import os
 import queue
 import shutil
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import av
 
@@ -37,10 +36,10 @@ SOURCE_NAME = "phonecam_mic"
 DESCRIPTION = "PhoneCam Mic"
 RATE = 48_000
 F_SETPIPE_SZ = 1031
-
-
-def fifo_path() -> Path:
-    return Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "phonecam-mic.fifo"
+# Measured latency of feed -> virtual source -> an app reading it (13-50 ms, median ~30 ms).
+# The video has no such stage after its v4l2 write, so auto A/V sync subtracts it.
+OUTPUT_LATENCY_MS = 30.0
+JITTER_MARGIN_MS = 15.0
 
 
 class VirtualMic:
@@ -52,7 +51,7 @@ class VirtualMic:
 
     @staticmethod
     def available() -> bool:
-        return shutil.which("pactl") is not None
+        return shutil.which("pactl") is not None and shutil.which("pw-cat") is not None
 
     def _pactl(self, *args: str) -> str:
         res = subprocess.run(
@@ -63,7 +62,7 @@ class VirtualMic:
         return res.stdout
 
     def _cleanup_stale(self) -> None:
-        """Unload PhoneCam pipe sources left over from a previous run that didn't exit cleanly."""
+        """Unload PhoneCam sources left over from a previous run that didn't exit cleanly."""
         try:
             out = self._pactl("list", "short", "modules")
         except Exception:
@@ -72,8 +71,11 @@ class VirtualMic:
             parts = line.split("\t")
             if (
                 len(parts) >= 3
-                and parts[1] == "module-pipe-source"
-                and f"source_name={SOURCE_NAME}" in parts[2]
+                and parts[1] in ("module-null-sink", "module-pipe-source")
+                and (
+                    f"sink_name={SOURCE_NAME}" in parts[2]
+                    or f"source_name={SOURCE_NAME}" in parts[2]
+                )
             ):
                 with contextlib.suppress(Exception):
                     self._pactl("unload-module", parts[0])
@@ -83,29 +85,24 @@ class VirtualMic:
         if self.module_id:
             return True
         if not self.available():
-            self.error = "pactl not found (install pulseaudio-utils)"
+            self.error = "pactl/pw-cat not found (install pulseaudio-utils and pipewire-bin)"
             return False
         self._cleanup_stale()
-        path = fifo_path()
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
         try:
             self.module_id = self._pactl(
                 "load-module",
-                "module-pipe-source",
-                f"source_name={SOURCE_NAME}",
-                f"file={path}",
-                "format=s16le",
-                f"rate={RATE}",
-                "channels=1",
-                f'source_properties=device.description="{DESCRIPTION}"',
+                "module-null-sink",
+                "media.class=Audio/Source/Virtual",
+                f"sink_name={SOURCE_NAME}",
+                "channel_map=mono",
+                f'sink_properties=device.description="{DESCRIPTION}"',
             ).strip()
         except Exception as e:
             self.error = str(e)
             log.error("could not create %s: %s", DESCRIPTION, e)
             return False
         self.error = None
-        log.info("created %s (module %s, %s)", DESCRIPTION, self.module_id, path)
+        log.info("created %s (module %s)", DESCRIPTION, self.module_id)
         return True
 
     def remove(self) -> None:
@@ -113,8 +110,92 @@ class VirtualMic:
             with contextlib.suppress(Exception):
                 self._pactl("unload-module", self.module_id)
             self.module_id = None
-        with contextlib.suppress(FileNotFoundError):
-            fifo_path().unlink()
+
+
+class PwCatSink:
+    """Low-latency playback stream into the virtual source."""
+
+    FEED = "phonecam_mic_feed"
+
+    def __init__(self, target: str | None = None) -> None:
+        self.target = target or SOURCE_NAME
+        self._proc: subprocess.Popen | None = None
+
+    def write(self, pcm: bytes) -> bool:
+        proc = self._ensure()
+        if proc is None or proc.stdin is None:
+            return False
+        try:
+            proc.stdin.write(pcm)
+            proc.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            self.close()
+            return False
+
+    def _ensure(self) -> subprocess.Popen | None:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc
+        self.close()
+        try:
+            proc = subprocess.Popen(
+                [
+                    "pw-cat",
+                    "--playback",
+                    "--raw",
+                    "--target",
+                    "0",
+                    "-P",
+                    f"{{ node.name = {self.FEED} node.description = PhoneCamMicFeed }}",
+                    "--rate",
+                    str(RATE),
+                    "--channels",
+                    "1",
+                    "--format",
+                    "s16",
+                    "--latency",
+                    "20ms",
+                    "-",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            log.warning("cannot start pw-cat: %s", e)
+            return None
+        assert proc.stdin is not None
+        with contextlib.suppress(OSError):
+            fcntl.fcntl(proc.stdin.fileno(), F_SETPIPE_SZ, 4096)  # ~42 ms: no hidden backlog
+        self._proc = proc
+        self._link()
+        return proc
+
+    def _link(self) -> None:
+        """Link our feed's output to the virtual source's input (ports appear asynchronously)."""
+        dest = f"{self.target}:input_MONO"
+        for _ in range(20):
+            out = subprocess.run(
+                ["pw-link", "-o"], capture_output=True, text=True, check=False
+            ).stdout
+            ports = [p.strip() for p in out.splitlines() if p.strip().startswith(self.FEED + ":")]
+            if ports:
+                for port in ports:
+                    subprocess.run(["pw-link", port, dest], capture_output=True, check=False)
+                log.info("PhoneCam Mic feed linked: %s -> %s", ports, dest)
+                return
+            time.sleep(0.05)
+        log.warning("PhoneCam Mic feed ports did not appear; audio may not reach the source")
+
+    def close(self) -> None:
+        if self._proc is not None:
+            with contextlib.suppress(Exception):
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+            with contextlib.suppress(Exception):
+                self._proc.terminate()
+                self._proc.wait(1)
+            self._proc = None
 
 
 @dataclass
@@ -130,9 +211,10 @@ class AudioStats:
 class AudioPipeline:
     """Thread: AUDIO packets in, scheduled PCM out to the FIFO."""
 
-    def __init__(self, clock: ClockSync) -> None:
+    def __init__(self, clock: ClockSync, sink=None) -> None:
         self._clock = clock
-        self._q: queue.Queue[tuple[str, object, int]] = queue.Queue(maxsize=200)
+        self._sink = sink if sink is not None else PwCatSink()
+        self._q: queue.Queue[tuple[str, object, int, int]] = queue.Queue(maxsize=200)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # A/V sync: auto = match the video's capture->v4l2 latency (set by the GUI); manual = fixed.
@@ -145,7 +227,6 @@ class AudioPipeline:
         self._codec = ""
         self._decoder: av.CodecContext | None = None
         self._resampler: av.AudioResampler | None = None
-        self._fd: int | None = None
         self._lat_sum = 0
         self._lat_n = 0
         self._late = 0
@@ -155,12 +236,14 @@ class AudioPipeline:
     # ---- producer side (called from the network thread; never blocks) ----
 
     def submit_config(self, payload: bytes) -> None:
-        self._put(("config", payload, 0))
+        self._put(("config", payload, 0, 0))
 
     def submit(self, payload: bytes, pts_us: int) -> None:
-        self._put(("frame", payload, pts_us))
+        # Arrival is stamped here, on receipt: measuring it after the jitter-buffer wait would
+        # feed the wait back into the target (a runaway latency loop).
+        self._put(("frame", payload, pts_us, now_us()))
 
-    def _put(self, item: tuple[str, object, int]) -> None:
+    def _put(self, item: tuple[str, object, int, int]) -> None:
         try:
             self._q.put_nowait(item)
         except queue.Full:
@@ -180,10 +263,10 @@ class AudioPipeline:
 
     def stop(self) -> None:
         self._stop.set()
-        self._put(("stop", b"", 0))
+        self._put(("stop", b"", 0, 0))
         if self._thread:
             self._thread.join(2)
-        self._close_fifo()
+        self._sink.close()
 
     def stats(self) -> AudioStats:
         s = AudioStats(
@@ -199,32 +282,13 @@ class AudioPipeline:
 
     # ---- worker ----
 
-    def _open_fifo(self) -> int | None:
-        if self._fd is not None:
-            return self._fd
-        try:
-            # Non-blocking open fails (ENXIO) instead of hanging if PipeWire isn't reading.
-            fd = os.open(fifo_path(), os.O_WRONLY | os.O_NONBLOCK)
-        except OSError as e:
-            if e.errno not in (errno.ENXIO, errno.ENOENT):
-                log.warning("cannot open %s: %s", fifo_path(), e)
-            return None
-        os.set_blocking(fd, True)
-        with contextlib.suppress(OSError):
-            fcntl.fcntl(fd, F_SETPIPE_SZ, 4096)  # ~42 ms: no hidden backlog
-        self._fd = fd
-        return fd
-
-    def _close_fifo(self) -> None:
-        if self._fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(self._fd)
-            self._fd = None
-
     def _effective_target(self) -> float:
         """Never below what audio needs to arrive (else every frame would be late)."""
-        floor = (self.arrival_ms or 60.0) + 25.0
-        wanted = self.video_latency_ms if self.auto and self.video_latency_ms else self.manual_ms
+        floor = (self.arrival_ms or 60.0) + JITTER_MARGIN_MS
+        if self.auto and self.video_latency_ms:
+            wanted = self.video_latency_ms - OUTPUT_LATENCY_MS
+        else:
+            wanted = self.manual_ms
         return max(floor, min(wanted, 600.0))
 
     def _configure(self, payload: bytes) -> None:
@@ -257,7 +321,7 @@ class AudioPipeline:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            kind, payload, pts = self._q.get()
+            kind, payload, pts, recv_us = self._q.get()
             if kind == "stop":
                 break
             try:
@@ -274,7 +338,7 @@ class AudioPipeline:
             self._last_frame_t = time.monotonic()
             capture_pc = self._clock.phone_to_pc(pts)
             if capture_pc is not None:
-                arrival = (now_us() - capture_pc) / 1000
+                arrival = (recv_us - capture_pc) / 1000
                 self.arrival_ms = (
                     arrival if self.arrival_ms is None else 0.95 * self.arrival_ms + 0.05 * arrival
                 )
@@ -286,14 +350,7 @@ class AudioPipeline:
                     continue
                 if wait > 0:
                     time.sleep(min(wait, 0.5))
-            fd = self._open_fifo()
-            if fd is None:
-                continue
-            try:
-                os.write(fd, pcm)
-            except OSError as e:
-                log.warning("writing PhoneCam Mic FIFO failed: %s", e)
-                self._close_fifo()
+            if not self._sink.write(pcm):
                 continue
             if capture_pc is not None:
                 self._lat_sum += now_us() - capture_pc

@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import subprocess
-import threading
 import time
-from pathlib import Path
 
 import av
 import numpy as np
@@ -19,36 +16,23 @@ from phonecam.clock import ClockSync, now_us
 FRAME = 960
 
 
+class ListSink:
+    """In-memory stand-in for the pw-cat feed: records (time, bytes) of every write."""
+
+    def __init__(self) -> None:
+        self.chunks: list[tuple[float, bytes]] = []
+
+    def write(self, pcm: bytes) -> bool:
+        self.chunks.append((time.monotonic(), pcm))
+        return True
+
+    def close(self) -> None:
+        pass
+
+
 @pytest.fixture
-def fifo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    path = tmp_path / "mic.fifo"
-    os.mkfifo(path)
-    monkeypatch.setattr(audio_mod, "fifo_path", lambda: path)
-    chunks: list[tuple[float, bytes]] = []
-    stop = threading.Event()
-
-    def reader() -> None:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        try:
-            while not stop.is_set():
-                try:
-                    data = os.read(fd, 65536)
-                except BlockingIOError:
-                    time.sleep(0.002)
-                    continue
-                if data:
-                    chunks.append((time.monotonic(), data))
-                else:
-                    time.sleep(0.002)
-        finally:
-            os.close(fd)
-
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
-    time.sleep(0.05)
-    yield chunks
-    stop.set()
-    t.join(1)
+def fifo() -> ListSink:
+    return ListSink()
 
 
 def synced_clock() -> ClockSync:
@@ -63,7 +47,7 @@ def pcm_config() -> bytes:
 
 
 def test_pcm_frames_are_written_at_capture_plus_target(fifo) -> None:
-    p = AudioPipeline(synced_clock())
+    p = AudioPipeline(synced_clock(), fifo)
     p.auto = False
     p.manual_ms = 150
     p.start()
@@ -73,15 +57,15 @@ def test_pcm_frames_are_written_at_capture_plus_target(fifo) -> None:
         frame = (np.ones(FRAME) * 1000).astype("<i2").tobytes()
         t0 = time.monotonic()
         p.submit(frame, t_cap)
-        assert _wait(lambda: sum(len(c) for _, c in fifo) >= len(frame))
-        delay = fifo[0][0] - t0
+        assert _wait(lambda: sum(len(c) for _, c in fifo.chunks) >= len(frame))
+        delay = fifo.chunks[0][0] - t0
         assert 0.10 < delay < 0.30, delay  # held back to ~capture + 150 ms (floor = arrival + 25)
     finally:
         p.stop()
 
 
 def test_late_frames_are_dropped(fifo) -> None:
-    p = AudioPipeline(synced_clock())
+    p = AudioPipeline(synced_clock(), fifo)
     p.auto = False
     p.manual_ms = 100
     p.start()
@@ -96,14 +80,14 @@ def test_late_frames_are_dropped(fifo) -> None:
 
 
 def test_target_never_below_arrival() -> None:
-    p = AudioPipeline(synced_clock())
+    p = AudioPipeline(synced_clock(), ListSink())
     p.auto = False
     p.manual_ms = 0
     p.arrival_ms = 80
-    assert p._effective_target() == pytest.approx(105)
+    assert p._effective_target() == pytest.approx(95)
     p.auto = True
-    p.video_latency_ms = 110
-    assert p._effective_target() == pytest.approx(110)
+    p.video_latency_ms = 150
+    assert p._effective_target() == pytest.approx(120)  # video - output latency (30)
 
 
 def opus_packets(seconds: float = 0.5) -> tuple[bytes, list[bytes]]:
@@ -130,7 +114,7 @@ def test_opus_roundtrip_through_pipeline(fifo) -> None:
     head, packets = opus_packets()
     # Android wraps OpusHead in its own container; the pipeline must find it.
     wrapped = b"AOPUSHDR" + len(head).to_bytes(8, "little") + head
-    p = AudioPipeline(synced_clock())
+    p = AudioPipeline(synced_clock(), fifo)
     p.start()
     try:
         cfg = {
@@ -143,8 +127,8 @@ def test_opus_roundtrip_through_pipeline(fifo) -> None:
         t = now_us()
         for i, pkt in enumerate(packets):
             p.submit(pkt, t + i * 20_000)
-        assert _wait(lambda: sum(len(c) for _, c in fifo) >= 0.3 * 48000 * 2, 3)
-        pcm = np.frombuffer(b"".join(c for _, c in fifo), "<i2").astype(float)
+        assert _wait(lambda: sum(len(c) for _, c in fifo.chunks) >= 0.3 * 48000 * 2, 3)
+        pcm = np.frombuffer(b"".join(c for _, c in fifo.chunks), "<i2").astype(float)
         assert np.sqrt(np.mean(pcm[4800:] ** 2)) > 2000  # the tone survived
     finally:
         p.stop()
@@ -176,3 +160,66 @@ def _wait(cond, timeout: float = 2.0) -> bool:
             return True
         time.sleep(0.01)
     return False
+
+
+def test_queue_wait_does_not_inflate_arrival(fifo) -> None:
+    """Regression: arrival must be measured on receipt, not after the jitter-buffer wait."""
+    p = AudioPipeline(synced_clock(), fifo)
+    p.auto = False
+    p.manual_ms = 200
+    p.start()
+    try:
+        p.submit_config(pcm_config())
+        t = now_us()
+        for i in range(10):  # 10 frames arriving at once, captured "now"
+            p.submit(b"\0\0" * FRAME, t + i * 20_000)
+        time.sleep(0.6)
+        assert p.arrival_ms is not None and p.arrival_ms < 50, p.arrival_ms
+        assert p.target_ms == pytest.approx(200)
+    finally:
+        p.stop()
+
+
+@pytest.mark.skipif(not VirtualMic.available(), reason="pactl/pw-cat not available")
+def test_pwcat_feed_reaches_virtual_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real PipeWire: tone written through PwCatSink must be recordable from the virtual source."""
+    from phonecam.audio import PwCatSink
+
+    monkeypatch.setattr(audio_mod, "SOURCE_NAME", "phonecam_mic_it")
+    mic = VirtualMic()
+    if not mic.create():
+        pytest.skip(f"cannot create source: {mic.error}")
+    rec = subprocess.Popen(
+        [
+            "pw-record",
+            "--raw",
+            "--target",
+            "phonecam_mic_it",
+            "--rate",
+            "48000",
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+            "-",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    sink = PwCatSink("phonecam_mic_it")
+    try:
+        time.sleep(0.3)
+        t = np.arange(FRAME) / 48000
+        tone = (np.sin(2 * np.pi * 440 * t) * 8000).astype("<i2").tobytes()
+        start = time.monotonic()
+        for i in range(50):  # 1 s, paced
+            assert sink.write(tone)
+            time.sleep(max(0.0, start + (i + 1) * 0.02 - time.monotonic()))
+        time.sleep(0.3)
+    finally:
+        sink.close()
+        rec.terminate()
+        data = rec.stdout.read() if rec.stdout else b""
+        mic.remove()
+    a = np.frombuffer(data[: len(data) // 2 * 2], "<i2").astype(float)
+    assert len(a) > 24000 and np.sqrt(np.mean(a**2)) > 1500

@@ -8,8 +8,9 @@ OBS, Firefox and Chrome can use.
 No third-party streaming libraries are used. The wire protocol is our own: see
 [docs/protocol.md](docs/protocol.md).
 
-> **Status:** Phase 6. USB and Wi-Fi (auto-discovery + pairing code). Latency: ~110 ms capture →
-> webcam; flash-test glass-to-v4l2 ~170 ms over USB and ~187 ms over Wi-Fi
+> **Status:** Phase 7 (all phases done). Video over USB and Wi-Fi (auto-discovery + pairing
+> code), phone microphone as **PhoneCam Mic**. Latency: ~110 ms capture → webcam; flash-test
+> glass-to-v4l2 ~170 ms over USB and ~187 ms over Wi-Fi; audio about 80 ms behind video
 > ([docs/latency.md](docs/latency.md)). PhoneCam webcam (`/dev/video10`) with full remote control from the PC
 > (camera, resolution, fps, bitrate, torch, focus, exposure, orientation), kept in sync with the
 > phone's own controls. Tray icon and app-grid entry.

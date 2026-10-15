@@ -93,8 +93,11 @@ class AudioStreamer(private val listener: Listener, private val voice: Boolean) 
                     encoder.getInputBuffer(inIdx)!!.apply { clear(); put(pcm) }
                     encoder.queueInputBuffer(inIdx, 0, pcm.size, ptsUs, 0)
                 }
+                // Wait briefly for this frame's packet so it leaves now, not one frame (20 ms) later.
+                var waitUs = 10_000L
                 while (true) {
-                    val outIdx = encoder.dequeueOutputBuffer(info, 0)
+                    val outIdx = encoder.dequeueOutputBuffer(info, waitUs)
+                    waitUs = 0
                     if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         val head = encoder.outputFormat.getByteBuffer("csd-0")
                         val bytes = head?.let { ByteArray(it.remaining()).also { b -> it.get(b) } }
@@ -123,13 +126,33 @@ class AudioStreamer(private val listener: Listener, private val voice: Boolean) 
         }
     }
 
-    /** Capture time of the first sample of the next frame, on CLOCK_BOOTTIME. */
+    /** Device frame index of our stream's first sample (see [framePtsUs]); null = uncalibrated. */
+    private var deviceBase: Long? = null
+
+    /**
+     * Capture time (CLOCK_BOOTTIME µs) of the first sample of the frame that starts at our stream
+     * position [framePos], called right after that frame was read.
+     *
+     * `AudioRecord.getTimestamp` maps a *device* frame index to its capture time, but on some
+     * devices (MediaTek) that index counts from when the microphone device opened, not from our
+     * recording start. So once, at the first frame, we estimate which device index our stream
+     * starts at (the frame just read ends roughly "now"), and then derive exact 20 ms-spaced
+     * timestamps from the latest device timestamp. We recalibrate if it drifts by > 0.5 s.
+     */
     private fun framePtsUs(rec: AudioRecord, ts: AudioTimestamp, framePos: Long): Long {
-        if (rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_BOOTTIME) == AudioRecord.SUCCESS) {
-            return (ts.nanoTime + (framePos - ts.framePosition) * 1_000_000_000L / RATE) / 1000
+        val nowNs = SystemClock.elapsedRealtimeNanos()
+        val fallbackUs = nowNs / 1000 - FRAME * 1_000_000L / RATE
+        if (rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_BOOTTIME) != AudioRecord.SUCCESS) return fallbackUs
+        val deviceNow = ts.framePosition + (nowNs - ts.nanoTime) * RATE / 1_000_000_000L
+        var base = deviceBase ?: (deviceNow - (framePos + FRAME)).also { deviceBase = it }
+        var ptsUs = (ts.nanoTime + (framePos + base - ts.framePosition) * 1_000_000_000L / RATE) / 1000
+        if (kotlin.math.abs(ptsUs - fallbackUs) > 500_000) {
+            Log.w(TAG, "audio timestamp jumped by ${(ptsUs - fallbackUs) / 1000} ms; recalibrating")
+            base = deviceNow - (framePos + FRAME)
+            deviceBase = base
+            ptsUs = (ts.nanoTime + (framePos + base - ts.framePosition) * 1_000_000_000L / RATE) / 1000
         }
-        // Fallback: the frame just finished reading, so it started one frame ago.
-        return SystemClock.elapsedRealtimeNanos() / 1000 - FRAME * 1_000_000L / RATE
+        return ptsUs
     }
 
     private fun createOpusEncoder(): MediaCodec? {

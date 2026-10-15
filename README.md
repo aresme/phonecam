@@ -8,8 +8,8 @@ OBS, Firefox and Chrome can use.
 No third-party streaming libraries are used. The wire protocol is our own: see
 [docs/protocol.md](docs/protocol.md).
 
-> **Status:** Phase 1. The phone captures, previews and hardware-encodes H.264 to a file.
-> Streaming to the PC arrives in phase 2, the virtual webcam in phase 3.
+> **Status:** Phase 2. Live video from the phone to the PC app over USB, with auto-reconnect.
+> The virtual webcam arrives in phase 3.
 
 > **Security:** the stream is unencrypted and unauthenticated. Use it over USB or on a trusted
 > LAN only.
@@ -52,10 +52,20 @@ adb install -r app/build/outputs/apk/debug/PhoneCam-0.1.0-debug.apk
 scripts/dev-run.sh
 ```
 
-## Phase 1: record a test clip
+## Daily use (USB)
+
+1. Plug in the phone (USB debugging on) and start the PC app: `pc/.venv/bin/phonecam`.
+2. Press **Launch app on phone** (or open PhoneCam on the phone and tap **Start**).
+3. Pick the device and press **Connect**. If the cable is unplugged, the phone app restarts, or
+   the phone is not streaming yet, the PC keeps retrying and reconnects on its own.
+
+Developing without a phone: `python -m phonecam.tools.fake_phone some.h264` serves a recording
+on 127.0.0.1. Connect to it with Wi-Fi mode and IP `127.0.0.1`.
+
+## Record a test clip on the phone
 
 1. Open PhoneCam on the phone and allow camera access.
-2. Tap **Start recording**, wait a few seconds, then tap **Stop**. Streaming continues with the
+2. Turn on **Also record to file**, tap **Start**, wait a few seconds, then tap **Stop**. Streaming continues with the
    screen off or the app in the background; the notification has a Stop action.
 3. Pull and play the clip:
 

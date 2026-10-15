@@ -38,6 +38,7 @@ class StreamingService : Service() {
     private var watcher: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private val engine get() = (application as PhoneCamApp).engine
+    private val server get() = (application as PhoneCamApp).server
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -54,7 +55,8 @@ class StreamingService : Service() {
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PhoneCam:streaming")
                 .apply { acquire() }
         }
-        engine.startStreaming(record = intent?.getBooleanExtra(EXTRA_RECORD, true) ?: true)
+        engine.startStreaming(record = intent?.getBooleanExtra(EXTRA_RECORD, false) ?: false)
+        server.start()
         if (watcher == null) {
             // Stop ourselves when streaming ends for any reason (UI, error, give-up).
             watcher = scope.launch {
@@ -69,6 +71,7 @@ class StreamingService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        server.stop()
         engine.stopStreaming()
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
@@ -92,7 +95,7 @@ class StreamingService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_phonecam)
             .setContentTitle("PhoneCam is streaming")
-            .setContentText("The camera is in use")
+            .setContentText("Camera is streaming to your computer")
             .setContentIntent(open)
             .addAction(0, "Stop", stop)
             .setOngoing(true)

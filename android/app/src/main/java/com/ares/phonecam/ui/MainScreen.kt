@@ -38,11 +38,15 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.ares.phonecam.camera.Facing
 import com.ares.phonecam.engine.EngineState
 import com.ares.phonecam.engine.StreamEngine
+import com.ares.phonecam.net.ServerState
+import com.ares.phonecam.net.StreamServer
 import com.ares.phonecam.service.StreamingService
 
 @Composable
-fun MainScreen(engine: StreamEngine) {
+fun MainScreen(engine: StreamEngine, server: StreamServer) {
     val state by engine.state.collectAsStateWithLifecycle()
+    val net by server.state.collectAsStateWithLifecycle()
+    var record by rememberSaveable { mutableStateOf(false) }
     val context = LocalContext.current
     var previewOn by rememberSaveable { mutableStateOf(true) }
     var statsOn by rememberSaveable { mutableStateOf(true) }
@@ -55,7 +59,7 @@ fun MainScreen(engine: StreamEngine) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("PhoneCam", style = MaterialTheme.typography.headlineSmall)
             Spacer(Modifier.weight(1f))
-            StatusChip(state)
+            StatusChip(state, net)
         }
 
         // Portrait-locked UI: the landscape stream shows rotated upright, so aspect = h / w.
@@ -74,7 +78,7 @@ fun MainScreen(engine: StreamEngine) {
                 } else {
                     Text("Preview off", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                if (statsOn) StatsOverlay(state, Modifier.align(Alignment.TopStart).padding(8.dp))
+                if (statsOn) StatsOverlay(state, net, Modifier.align(Alignment.TopStart).padding(8.dp))
             }
         }
 
@@ -85,6 +89,10 @@ fun MainScreen(engine: StreamEngine) {
             Text("Stats")
             Spacer(Modifier.width(8.dp))
             Switch(checked = statsOn, onCheckedChange = { statsOn = it })
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Also record to file", Modifier.weight(1f))
+            Switch(checked = record, enabled = !state.streaming, onCheckedChange = { record = it })
         }
 
         if (cfg != null) {
@@ -106,34 +114,35 @@ fun MainScreen(engine: StreamEngine) {
 
         Button(
             onClick = {
-                if (state.streaming) StreamingService.stop(context) else StreamingService.start(context, record = true)
+                if (state.streaming) StreamingService.stop(context) else StreamingService.start(context, record = record)
             },
             enabled = cfg != null,
             colors = if (state.streaming) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
             else ButtonDefaults.buttonColors(),
             modifier = Modifier.fillMaxWidth().height(56.dp),
         ) {
-            Text(if (state.streaming) "Stop" else "Start recording", style = MaterialTheme.typography.titleMedium)
+            Text(if (state.streaming) "Stop" else "Start", style = MaterialTheme.typography.titleMedium)
         }
     }
 }
 
 @Composable
-private fun StatusChip(state: EngineState) {
+private fun StatusChip(state: EngineState, net: ServerState) {
     val (label, color) = when {
         state.error != null -> "Error" to MaterialTheme.colorScheme.error
-        state.streaming -> "Recording" to Color(0xFF4CAF50)
+        state.streaming && net.connected -> "Connected via ${net.transport?.label}" to Color(0xFF4CAF50)
+        state.streaming -> "Waiting for PC" to Color(0xFFFFB300)
         else -> "Idle" to MaterialTheme.colorScheme.onSurfaceVariant
     }
     AssistChip(onClick = {}, label = { Text(label) }, colors = AssistChipDefaults.assistChipColors(labelColor = color))
 }
 
 @Composable
-private fun StatsOverlay(state: EngineState, modifier: Modifier) {
+private fun StatsOverlay(state: EngineState, net: ServerState, modifier: Modifier) {
     val s = state.stats
     val text = if (state.streaming) {
-        "%.1f fps\n%.2f Mbit/s\nframes %d\npipeline %.0f ms (max %.0f)".format(
-            s.fps, s.bitrateBps / 1e6, s.frames, s.pipelineMs, s.pipelineMaxMs,
+        "%.1f fps\n%.2f Mbit/s\nframes %d\npipeline %.0f ms (max %.0f)\nPC %s".format(
+            s.fps, s.bitrateBps / 1e6, s.frames, s.pipelineMs, s.pipelineMaxMs, net.videoClient ?: "—",
         )
     } else {
         "not streaming"

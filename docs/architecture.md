@@ -57,11 +57,13 @@ Python 3.14 (Ubuntu 26.04), PySide6 (system package), PyAV, numpy, pyvirtualcam 
 
 | Thread    | Work | Hand-off |
 |-----------|------|----------|
-| `net`     | Blocking reads on the video socket (`read_packet`). Tracks CONFIG and waits for the first keyframe. | Bounded queue (small; on overflow drop to the next keyframe) → `decode` |
-| `decode`  | PyAV `CodecContext` H.264. Tries VAAPI hwaccel, falls back to software. `flags=LOW_DELAY`, `thread_type=SLICE` (no frame threading, which adds a frame of delay per thread). | Writes into the **latest-frame slot** |
+| `supervisor` | Runs `adb forward` and connects (control first, HELLO, then video). For the life of the session it does blocking reads on the video socket (3 s timeout). On any error it tears down and reconnects with backoff. | Bounded queue (8) → `decode`. A full queue applies backpressure, so the phone's drop queue takes over |
+| `decode`  | PyAV `CodecContext` H.264. Waits for a keyframe after CONFIG or an error. Software decode for now; VAAPI comes in phase 5 (PyAV's bundled FFmpeg has no VAAPI). `flags=LOW_DELAY`, `thread_type=SLICE` (no frame threading, which adds a frame of delay per thread). | Writes into the **latest-frame slot** |
 | `output`  | Waits on the slot, converts to the v4l2 pixel format, writes to `/dev/video10` at the fixed output size. Without input for a while it repeats the last frame, or shows a "PhoneCam disconnected" placeholder. | — |
-| `control` | Control socket: HELLO, CONTROL_REQ/RES, STATE, STATS, PING every 500 ms, clock offset (min-RTT over a 20-sample window). | Qt signals → GUI |
-| GUI (main)| Qt widgets. Receives preview frames as downscaled `QImage`s at most 30 fps through a queued signal. Gets stats at 4 Hz. | — |
+| `control` | Control socket: CONTROL_REQ/RES, STATE, STATS, PING every 500 ms, clock offset (min-RTT over a 20-sample window). No PONG for 3 s ends the session. Reports stats. | Listener → Qt signals → GUI |
+| `preview` | Reads its own latest-frame slot, at most 30 fps: swscale to ≤960 px wide RGB, `QImage`, then a queued signal to the GUI. | — |
+| `adb-monitor` | Polls `adb devices -l` every 1.5 s and updates the device list (unplug/replug). | Qt signal |
+| GUI (main)| Qt widgets only. Never blocks: connect, disconnect and adb calls run on short-lived background threads. Stats arrive at 2 Hz. | — |
 
 ### Latest-frame slot
 
@@ -72,7 +74,7 @@ and output never consumes stale frames, so no backlog can form between them. Thi
 ### adb
 
 `adb` runs only through `subprocess` from worker threads, never on the GUI thread. A device
-monitor (`adb track-devices`) detects unplug/replug. Each (re)connect re-runs
+monitor polls `adb devices -l` to detect unplug/replug. Each (re)connect re-runs
 `adb -s SERIAL forward tcp:47100 tcp:47100` (and the same for 47101).
 
 ### Reconnect

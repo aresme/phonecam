@@ -101,7 +101,7 @@ class StreamEngine(context: Context) {
     val state: StateFlow<EngineState> = _state.asStateFlow()
 
     // ---- camera-thread-only state ----
-    private var encoder: VideoEncoder? = null
+    @Volatile private var encoder: VideoEncoder? = null // read from other threads for keyframe requests
     private var encoderBitrate = 0
     private var previewTexture: SurfaceTexture? = null
     private var previewSurface: Surface? = null

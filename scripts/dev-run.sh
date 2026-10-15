@@ -20,7 +20,7 @@ if (( BUILD )); then
 fi
 adb "${SERIAL_ARGS[@]}" forward tcp:47100 tcp:47100
 adb "${SERIAL_ARGS[@]}" forward tcp:47101 tcp:47101
-adb "${SERIAL_ARGS[@]}" shell am start -n com.ares.phonecam/.MainActivity >/dev/null
+adb "${SERIAL_ARGS[@]}" shell am start -n com.ares.phonecam/.MainActivity --ez autostart true >/dev/null
 
 if [[ ! -x "$ROOT/pc/.venv/bin/python" ]]; then
     python3 -m venv --without-pip --system-site-packages "$ROOT/pc/.venv"

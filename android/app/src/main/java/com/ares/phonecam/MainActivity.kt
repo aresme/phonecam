@@ -1,6 +1,8 @@
 package com.ares.phonecam
 
+import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -9,6 +11,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import com.ares.phonecam.service.StreamingService
 import com.ares.phonecam.ui.MainScreen
 import com.ares.phonecam.ui.PermissionScreen
 import com.ares.phonecam.ui.hasCameraPermission
@@ -18,13 +21,35 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val engine = (application as PhoneCamApp).engine
+        val app = application as PhoneCamApp
+        handleAutostart(intent)
         setContent {
             PhoneCamTheme {
                 val context = LocalContext.current
                 var granted by remember { mutableStateOf(hasCameraPermission(context)) }
-                if (granted) MainScreen(engine) else PermissionScreen(onGranted = { granted = true })
+                if (granted) MainScreen(app.engine, app.server) else PermissionScreen(onGranted = { granted = true })
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleAutostart(intent)
+    }
+
+    /** `adb shell am start -n com.ares.phonecam/.MainActivity --ez autostart true` starts streaming. */
+    private fun handleAutostart(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_AUTOSTART, false) != true) return
+        intent.removeExtra(EXTRA_AUTOSTART) // not again on recreation
+        if (hasCameraPermission(this)) {
+            Log.i(TAG, "autostart requested")
+            StreamingService.start(this, record = false)
+        } else {
+            Log.w(TAG, "autostart ignored: camera permission not granted")
+        }
+    }
+
+    companion object {
+        const val EXTRA_AUTOSTART = "autostart"
     }
 }

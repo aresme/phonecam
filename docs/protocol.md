@@ -217,11 +217,15 @@ Reserved for phase 7. Receivers that don't implement it skip it like any unknown
 ## 4. Clock
 
 `pts_us` and all phone timestamps use Android `SystemClock.elapsedRealtimeNanos() / 1000`
-(CLOCK_BOOTTIME). It is monotonic and keeps counting through deep sleep. On cameras with
-`SENSOR_INFO_TIMESTAMP_SOURCE == REALTIME` (the case on the Infinix X6886), `SENSOR_TIMESTAMP`
-and the encoder's Surface timestamps are already on this clock. On `UNKNOWN` sources, the phone
-measures the offset between sensor timestamps and `elapsedRealtimeNanos` when the session starts
-and corrects for it.
+(CLOCK_BOOTTIME). It is monotonic and keeps counting through deep sleep.
+
+Frames reach the encoder through a Surface, and the camera framework often re-bases their
+timestamps to CLOCK_MONOTONIC for video-encoder consumers (for A/V sync), even when
+`SENSOR_INFO_TIMESTAMP_SOURCE == REALTIME`. The Infinix X6886 does this. The phone therefore
+detects the encoder's timestamp base from the first frame: if the timestamp is closest to
+`System.nanoTime()`, it is CLOCK_MONOTONIC. In that case the phone adds
+`elapsedRealtimeNanos − nanoTime`, which only changes across deep sleep, and streaming holds a
+wake lock.
 
 The PC uses `time.monotonic_ns() // 1000`.
 

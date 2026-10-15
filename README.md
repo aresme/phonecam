@@ -8,8 +8,8 @@ OBS, Firefox and Chrome can use.
 No third-party streaming libraries are used. The wire protocol is our own: see
 [docs/protocol.md](docs/protocol.md).
 
-> **Status:** Phase 0 (foundations). Both apps build and open; protocol codecs are tested on both
-> sides. Streaming arrives in phases 1–3.
+> **Status:** Phase 1. The phone captures, previews and hardware-encodes H.264 to a file.
+> Streaming to the PC arrives in phase 2, the virtual webcam in phase 3.
 
 > **Security:** the stream is unencrypted and unauthenticated. Use it over USB or on a trusted
 > LAN only.
@@ -51,6 +51,25 @@ adb install -r app/build/outputs/apk/debug/PhoneCam-0.1.0-debug.apk
 # Or all at once
 scripts/dev-run.sh
 ```
+
+## Phase 1: record a test clip
+
+1. Open PhoneCam on the phone and allow camera access.
+2. Tap **Start recording**, wait a few seconds, then tap **Stop**. Streaming continues with the
+   screen off or the app in the background; the notification has a Stop action.
+3. Pull and play the clip:
+
+```bash
+adb shell ls /sdcard/Android/data/com.ares.phonecam/files/recordings/
+adb pull /sdcard/Android/data/com.ares.phonecam/files/recordings/<file>.h264
+ffplay -f h264 -framerate 30 <file>.h264
+```
+
+The clip is in sensor orientation (landscape). It's upright when the phone is held in landscape
+with its top to the left.
+
+Debug logging on the phone: `adb shell setprop log.tag.PhoneCam VERBOSE`, then
+`adb logcat -s PhoneCam` shows per-second encoder stats.
 
 ## Troubleshooting
 

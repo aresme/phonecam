@@ -23,6 +23,8 @@ data class SavedSettings(
     val orientation: String? = null,
     val keepScreenOn: Boolean = false,
     val transport: String = "usb",
+    val requirePairing: Boolean = true,
+    val pairingCode: String? = null,
 )
 
 class SettingsRepository(context: Context) {
@@ -37,6 +39,8 @@ class SettingsRepository(context: Context) {
         val orientation = stringPreferencesKey("orientation")
         val keepScreenOn = booleanPreferencesKey("keep_screen_on")
         val transport = stringPreferencesKey("transport")
+        val requirePairing = booleanPreferencesKey("require_pairing")
+        val pairingCode = stringPreferencesKey("pairing_code")
     }
 
     val settings: Flow<SavedSettings> = store.data.map { it.toSettings() }
@@ -62,6 +66,22 @@ class SettingsRepository(context: Context) {
         store.edit { it[Keys.transport] = transport }
     }
 
+    suspend fun setRequirePairing(on: Boolean) {
+        store.edit { it[Keys.requirePairing] = on }
+    }
+
+    /** The Wi-Fi pairing code, created on first use. */
+    suspend fun pairingCode(): String {
+        load().pairingCode?.let { return it }
+        return newPairingCode()
+    }
+
+    suspend fun newPairingCode(): String {
+        val code = "%04d".format(java.security.SecureRandom().nextInt(10_000))
+        store.edit { it[Keys.pairingCode] = code }
+        return code
+    }
+
     private fun Preferences.toSettings() = SavedSettings(
         cameraId = this[Keys.camera],
         width = this[Keys.width],
@@ -71,5 +91,7 @@ class SettingsRepository(context: Context) {
         orientation = this[Keys.orientation],
         keepScreenOn = this[Keys.keepScreenOn] ?: false,
         transport = this[Keys.transport] ?: "usb",
+        requirePairing = this[Keys.requirePairing] ?: true,
+        pairingCode = this[Keys.pairingCode],
     )
 }

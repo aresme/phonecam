@@ -44,6 +44,8 @@ class FakePhone:
         video_port: int = 0,
         control_port: int = 0,
         capture_delay_ms: float = 0,
+        pairing: str | None = None,
+        announce: bool = False,
     ) -> None:
         self.config, self.aus = group_access_units(stream)
         first_key = next((i for i, au in enumerate(self.aus) if au.keyframe), None)
@@ -58,6 +60,11 @@ class FakePhone:
         self.video_port = self._video_srv.getsockname()[1]
         self.control_port = self._ctrl_srv.getsockname()[1]
         self.frames_sent = 0
+        self.pairing = pairing
+        self._paired = False  # a control client sent the right code (gates the video port)
+        self._announce = announce
+        self._zc = None
+        self._host = host
         self._clients: dict[str, socket.socket] = {}
         self._lock = threading.Lock()
         self._threads = [
@@ -82,10 +89,34 @@ class FakePhone:
     def start(self) -> FakePhone:
         for t in self._threads:
             t.start()
+        if self._announce:
+            self._register_mdns()
         return self
+
+    def _register_mdns(self) -> None:
+        from zeroconf import ServiceInfo, Zeroconf
+
+        self._zc = Zeroconf()
+        self._service = ServiceInfo(
+            "_phonecam._tcp.local.",
+            f"PhoneCam Fake {self.control_port}._phonecam._tcp.local.",
+            addresses=[socket.inet_aton(self._host if self._host != "0.0.0.0" else "127.0.0.1")],
+            port=self.control_port,
+            properties={
+                "model": "Fake Phone",
+                "video": str(self.video_port),
+                "version": "1",
+                "pairing": "1" if self.pairing else "0",
+            },
+        )
+        self._zc.register_service(self._service)
 
     def stop(self) -> None:
         self._stop.set()
+        if self._zc is not None:
+            with contextlib.suppress(Exception):
+                self._zc.unregister_service(self._service)
+                self._zc.close()
         for s in (self._video_srv, self._ctrl_srv, *self._clients.values()):
             with contextlib.suppress(OSError):
                 s.shutdown(socket.SHUT_RDWR)
@@ -115,6 +146,9 @@ class FakePhone:
 
     def _serve_video(self, sock: socket.socket) -> None:
         period = 1 / self.fps
+        if self.pairing and not self._paired:
+            sock.close()  # like the phone: video only for paired clients
+            return
         try:
             sock.sendall(Packet(PacketType.CONFIG, self.config).encode())
             next_t = time.monotonic()
@@ -154,6 +188,15 @@ class FakePhone:
                 if not data:
                     return
                 for p in dec.feed(data):
+                    if p.type == PacketType.HELLO and self.pairing:
+                        got = p.json().get("pairing")
+                        if got != self.pairing:
+                            err = "pairing_failed" if got else "pairing_required"
+                            sock.sendall(
+                                json_packet(PacketType.HELLO, {"version": 1, "error": err}).encode()
+                            )
+                            return
+                        self._paired = True
                     if p.type == PacketType.HELLO:
                         sock.sendall(
                             json_packet(
@@ -182,9 +225,19 @@ def main() -> None:
     ap.add_argument("file", type=Path)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--pairing", help="require this pairing code")
+    ap.add_argument("--announce", action="store_true", help="announce via mDNS (_phonecam._tcp)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
-    phone = FakePhone(args.file.read_bytes(), args.fps, args.host, VIDEO_PORT, CONTROL_PORT).start()
+    phone = FakePhone(
+        args.file.read_bytes(),
+        args.fps,
+        args.host,
+        VIDEO_PORT,
+        CONTROL_PORT,
+        pairing=args.pairing,
+        announce=args.announce,
+    ).start()
     print(f"fake phone: {len(phone.aus)} frames on {args.host}:{VIDEO_PORT}/{CONTROL_PORT}")
     try:
         while True:

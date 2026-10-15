@@ -19,7 +19,15 @@ The phone is the TCP **server** on two ports. The PC is the client.
 - Both ends set `TCP_NODELAY`.
 - **One client at a time.** When a new connection is accepted on a port, the phone closes the
   previous connection on that port. The PC opens control first, then video.
-- There is no encryption or authentication. Use it on USB or a trusted LAN only.
+- There is no encryption. Use it on USB or a trusted LAN only.
+- **Pairing (Wi-Fi):** unless disabled on the phone, a client that is not on the phone's loopback
+  interface (i.e. not USB/adb forward) must send the 4-digit code shown on the phone in its HELLO
+  (`"pairing": "1234"`). The phone then authorizes that IP for the video port while the control
+  connection lives, plus 10 s. An unpaired client never replaces the current PC. This keeps
+  casual users of a shared network out; it is not protection against an attacker who can sniff
+  the network.
+- **Discovery:** the phone announces `_phonecam._tcp` (DNS-SD/mDNS) on the control port while
+  streaming. TXT records: `model`, `video` (video port), `version`, `app`, `pairing` (`1`/`0`).
 
 ## 2. Packet framing
 
@@ -86,8 +94,12 @@ rotates after decoding. The video is not mirrored; mirroring is a PC-side output
 The PC sends it first on the control connection:
 
 ```json
-{"client": "phonecam-pc/0.1.0", "version": 1}
+{"client": "phonecam-pc/0.1.0", "version": 1, "pairing": "1234"}
 ```
+
+`pairing` is only needed over Wi-Fi (see §1). If it is missing or wrong, the phone replies
+`{"server": "...", "version": 1, "error": "pairing_required" | "pairing_failed"}` and closes the
+connection; the PC should ask the user for the code instead of retrying.
 
 The phone replies with its capabilities and current settings:
 

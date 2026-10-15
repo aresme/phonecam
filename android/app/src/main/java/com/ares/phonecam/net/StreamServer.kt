@@ -53,6 +53,9 @@ data class ServerState(
     val videoClient: String? = null,
     val controlClient: String? = null,
     val error: String? = null,
+    /** Required from non-USB clients in HELLO; null = pairing disabled. */
+    val pairingCode: String? = null,
+    val rejected: String? = null,
 ) {
     val connected get() = videoClient != null
     /** adb forward connections arrive from adbd on the phone's loopback interface. */
@@ -71,15 +74,28 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
     private val serverSockets = mutableListOf<ServerSocket>()
     @Volatile private var video: VideoClient? = null
     @Volatile private var control: Socket? = null
+    @Volatile private var pairingCode: String? = null
+    /** Remote IPs with a paired control connection (value: expiry, ms since boot; MAX = connected). */
+    private val authorized = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun isLoopback(ip: String) = ip == "127.0.0.1" || ip == "::1" || ip.startsWith("127.")
+
+    private fun isAuthorized(ip: String): Boolean {
+        if (pairingCode == null || isLoopback(ip)) return true
+        val until = authorized[ip] ?: return false
+        return until == Long.MAX_VALUE || SystemClock.elapsedRealtime() < until
+    }
 
     @Synchronized
-    fun start() {
+    fun start(pairing: String? = null) {
+        pairingCode = pairing
+        _state.update { it.copy(pairingCode = pairing) }
         if (scope != null) return
         val s = CoroutineScope(
             SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e -> Log.e(TAG, "server coroutine failed", e) },
         )
         scope = s
-        _state.value = ServerState(running = true)
+        _state.value = ServerState(running = true, pairingCode = pairing)
         s.launch { acceptLoop(Protocol.VIDEO_PORT, ::onVideoClient) }
         s.launch { acceptLoop(Protocol.CONTROL_PORT) { sock -> s.launch { serveControl(sock) } } }
         Log.i(TAG, "stream server started on ${Protocol.VIDEO_PORT}/${Protocol.CONTROL_PORT}")
@@ -128,6 +144,13 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
     private fun currentScopeActive() = scope?.isActive == true
 
     private fun onVideoClient(sock: Socket) {
+        val ip = sock.inetAddress?.hostAddress ?: ""
+        if (!isAuthorized(ip)) {
+            Log.w(TAG, "video connection from $ip rejected: not paired")
+            _state.update { it.copy(rejected = ip) }
+            runCatching { sock.close() }
+            return
+        }
         // Keep the kernel send buffer small so congestion shows up in our drop queue instead of
         // as hidden latency in the socket.
         runCatching { sock.sendBufferSize = 128 * 1024 }
@@ -148,42 +171,62 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
     // ------------------------------------------------------------------ control channel
 
     private suspend fun serveControl(sock: Socket) {
-        control?.let { runCatching { it.close() } }
-        control = sock
         val remote = sock.inetAddress?.hostAddress ?: "?"
-        _state.update { it.copy(controlClient = remote) }
         val writer = PacketWriter(BufferedOutputStream(sock.getOutputStream(), 64 * 1024))
         var statsJob: Job? = null
         var stateJob: Job? = null
+        var paired = false
         try {
+            sock.soTimeout = 10_000 // an unpaired client must send HELLO promptly
             val reader = PacketReader(BufferedInputStream(sock.getInputStream()))
-            statsJob = scope?.launch {
-                try {
-                    while (isActive) {
-                        delay(1000)
-                        writer.write(Packet.json(PacketType.STATS, statsJson(remote).toString()))
-                    }
-                } catch (_: IOException) {
-                    // socket gone; the read loop notices and cleans up
-                }
-            }
-            stateJob = scope?.launch {
-                // Push STATE whenever the published settings change (from the PC or the phone UI).
-                engine.state.map { stateJson(it).toString() }.distinctUntilChanged().drop(1).collect { json ->
-                    try {
-                        writer.write(Packet.json(PacketType.STATE, json))
-                    } catch (_: IOException) {
-                    }
-                }
-            }
             while (true) {
                 val p = reader.read() ?: break
+                if (!paired && p.type != PacketType.HELLO) break // HELLO comes first
                 when (p.type) {
                     PacketType.PING -> writer.write(Packet.pong(Packet.parsePing(p), nowUs()))
                     PacketType.HELLO -> {
-                        Log.i(TAG, "HELLO from $remote: ${p.payload.decodeToString()}")
+                        if (paired) continue
+                        Log.i(TAG, "HELLO from $remote")
+                        val hello = runCatching { JSONObject(p.payload.decodeToString()) }.getOrDefault(JSONObject())
+                        val code = pairingCode
+                        if (code != null && !isLoopback(remote) && hello.optString("pairing") != code) {
+                            val err = if (hello.has("pairing")) "pairing_failed" else "pairing_required"
+                            Log.w(TAG, "HELLO from $remote rejected: $err")
+                            _state.update { it.copy(rejected = remote) }
+                            writer.write(Packet.json(PacketType.HELLO, JSONObject()
+                                .put("server", "phonecam-android/${BuildConfig.VERSION_NAME}")
+                                .put("version", Protocol.VERSION).put("error", err).toString()))
+                            break
+                        }
+                        // Paired: this connection replaces the previous PC (only now, so an
+                        // unpaired device can't kick the current one off).
+                        paired = true
+                        sock.soTimeout = 0
+                        authorized[remote] = Long.MAX_VALUE
+                        control?.let { runCatching { it.close() } }
+                        control = sock
+                        _state.update { it.copy(controlClient = remote, rejected = null) }
                         writer.write(Packet.json(PacketType.HELLO, helloJson().toString()))
                         writer.write(Packet.json(PacketType.STATE, stateJson(engine.state.value).toString()))
+                        statsJob = scope?.launch {
+                            try {
+                                while (isActive) {
+                                    delay(1000)
+                                    writer.write(Packet.json(PacketType.STATS, statsJson(remote).toString()))
+                                }
+                            } catch (_: IOException) {
+                                // socket gone; the read loop notices and cleans up
+                            }
+                        }
+                        stateJob = scope?.launch {
+                            // Push STATE whenever the published settings change (PC or phone UI).
+                            engine.state.map { stateJson(it).toString() }.distinctUntilChanged().drop(1).collect { json ->
+                                try {
+                                    writer.write(Packet.json(PacketType.STATE, json))
+                                } catch (_: IOException) {
+                                }
+                            }
+                        }
                     }
                     PacketType.CONTROL_REQ -> writer.write(Packet.json(PacketType.CONTROL_RES, handleRequest(p).toString()))
                     else -> Unit // unknown or not for us: skipped
@@ -191,12 +234,16 @@ class StreamServer(private val context: Context, private val engine: StreamEngin
             }
         } catch (e: SocketException) {
             Log.i(TAG, "control client $remote: ${e.message}")
+        } catch (e: java.net.SocketTimeoutException) {
+            Log.w(TAG, "control client $remote sent no HELLO")
         } catch (e: IOException) {
             Log.w(TAG, "control client $remote failed", e)
         } finally {
             statsJob?.cancel()
             stateJob?.cancel()
             runCatching { sock.close() }
+            // Keep the IP authorized briefly so a video reconnect right after a control drop works.
+            if (paired) authorized[remote] = SystemClock.elapsedRealtime() + 10_000
             if (control === sock) {
                 control = null
                 _state.update { it.copy(controlClient = null) }

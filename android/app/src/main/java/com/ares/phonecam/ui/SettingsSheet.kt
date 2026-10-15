@@ -22,6 +22,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -51,6 +52,10 @@ fun SettingsSheet(
     onKeepScreenOnChange: (Boolean) -> Unit,
     record: Boolean,
     onRecordChange: (Boolean) -> Unit,
+    requirePairing: Boolean,
+    onRequirePairingChange: (Boolean) -> Unit,
+    pairingCode: String?,
+    onNewPairingCode: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val cfg = state.config ?: return
@@ -122,6 +127,21 @@ fun SettingsSheet(
             SwitchRow("Show stats overlay", statsOn, onStatsChange)
             SwitchRow("Keep screen on while streaming", keepScreenOn, onKeepScreenOnChange)
             SwitchRow("Also record to file", record, onRecordChange, enabled = !state.streaming)
+            HorizontalDivider()
+            SwitchRow("Require pairing code on Wi-Fi", requirePairing, onRequirePairingChange)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (requirePairing) "Code: ${pairingCode ?: "…"}" else "Wi-Fi connections are not protected",
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                TextButton(onClick = onNewPairingCode, enabled = requirePairing) { Text("New code") }
+            }
+            Text(
+                "USB connections never need the code. The video itself is not encrypted: use trusted networks.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             HorizontalDivider()
             Text(
                 "Encoder: ${state.encoderName ?: "starts with the stream"}${if (state.encoderName != null) if (state.encoderHardware) " (hardware)" else " (software)" else ""}",

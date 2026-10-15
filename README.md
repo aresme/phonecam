@@ -111,6 +111,19 @@ Everything can be changed from either side, and both UIs stay in sync:
 - **Decoder:** software is fastest. VAAPI hardware decoding uses less CPU and needs PyAV built
   against Ubuntu's FFmpeg: `scripts/build-pyav-vaapi.sh`.
 
+### Wi-Fi
+
+1. Put the phone and the PC on the same network and tap **Start** on the phone. Its Wi-Fi
+   address and a 4-digit **pairing code** are shown under the preview.
+2. In the PC app choose **Wi-Fi**. Phones running PhoneCam are found automatically (mDNS). Pick
+   yours, or type its IP, and press **Connect**. Enter the pairing code once; it's remembered
+   per address.
+3. Recent addresses stay in the list. USB never needs the code. The code can be renewed or
+   disabled in the phone's settings sheet.
+
+The video is not encrypted. The pairing code only keeps other people on the same network from
+watching or taking over the stream. Use Wi-Fi mode on networks you trust.
+
 ### Tray icon
 
 With a tray (Ubuntu's AppIndicator extension, enabled by default), closing the window keeps
@@ -171,4 +184,22 @@ Debug logging on the phone: `adb shell setprop log.tag.PhoneCam VERBOSE`, then
   same GNOME/Qt bug: start it with `QT_QPA_PLATFORMTHEME=gnome obs`, or add
   `QT_QPA_PLATFORMTHEME=gnome` to `~/.config/environment.d/qt.conf` and log in again.
 
-More troubleshooting (Wi-Fi, firewall/nftables) comes with the phases that need it.
+- **Wi-Fi: the phone shows up in the list but connecting times out** (and `ping <phone-ip>`
+  fails). The network uses *client isolation* (common on guest, public and campus Wi-Fi):
+  devices can reach the router but not each other. Multicast discovery may still get through.
+  Use USB, a home network, or the phone's hotspot: connect the PC to it, and the phone address
+  is usually `192.168.x.1`, shown on the phone as "Hotspot".
+- **Wi-Fi: no phones found.** mDNS is UDP 5353 multicast. Some networks or firewalls block it;
+  type the IP shown on the phone instead.
+- **nftables.** The PC only makes outgoing connections to the phone (TCP 47100/47101), so a
+  default `ct state established,related accept` input rule is enough. For discovery, also allow
+  mDNS replies:
+
+  ```
+  sudo nft add rule inet filter input udp dport 5353 accept
+  ```
+
+  (Adapt the table/chain names to your ruleset: `sudo nft list ruleset`.)
+- **Camera in use.** If another app (e.g. the stock camera) takes the camera, PhoneCam shows
+  "Camera in use by another app — waiting" and resumes on its own when it is released. The PC
+  keeps the connection and shows the last frame or the placeholder meanwhile.

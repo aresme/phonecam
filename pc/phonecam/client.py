@@ -54,6 +54,7 @@ class Target:
     serial: str | None = None  # set for USB: adb forward is (re)run on every connect
     video_port: int = VIDEO_PORT
     control_port: int = CONTROL_PORT
+    pairing: str | None = None  # Wi-Fi pairing code shown on the phone
 
     @property
     def transport(self) -> str:
@@ -92,10 +93,21 @@ class ClientListener(Protocol):
     def on_hello(self, hello: dict[str, Any]) -> None: ...
     def on_state(self, state: dict[str, Any]) -> None: ...
     def on_stats(self, stats: Stats) -> None: ...
+    def on_pairing(self, kind: str) -> None: ...  # "pairing_required" | "pairing_failed"
 
 
 class _SessionEnded(Exception):
     pass
+
+
+class PairingError(_SessionEnded):
+    """The phone wants a (correct) pairing code; retrying without user input is pointless."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(
+            "pairing code required" if kind == "pairing_required" else "wrong pairing code"
+        )
+        self.kind = kind
 
 
 class StreamClient:
@@ -133,7 +145,7 @@ class StreamClient:
         return self._supervisor is not None and self._supervisor.is_alive()
 
     def connect(self, target: Target) -> None:
-        self.disconnect()
+        self.disconnect(notify=False)  # replacing a session is not a user-visible disconnect
         self._target = target
         self._stop.clear()
         self.preview_slot.reopen()
@@ -141,7 +153,7 @@ class StreamClient:
         self._supervisor = threading.Thread(target=self._supervise, name="supervisor", daemon=True)
         self._supervisor.start()
 
-    def disconnect(self, timeout: float = 3.0) -> None:
+    def disconnect(self, timeout: float = 3.0, notify: bool = True) -> None:
         sup = self._supervisor
         if sup is None:
             return
@@ -153,7 +165,8 @@ class StreamClient:
         if target and target.serial and self.adb:
             for port in (target.video_port, target.control_port):
                 self.adb.remove_forward(target.serial, port)
-        self.listener.on_status("Disconnected", False)
+        if notify:
+            self.listener.on_status("Disconnected", False)
 
     def send_request(self, cmd: str, **args: Any) -> int | None:
         """Send a CONTROL_REQ; returns its id, or None if not connected."""
@@ -182,6 +195,12 @@ class StreamClient:
             reason = ""
             try:
                 self._session(target)
+            except PairingError as e:
+                log.info("pairing: %s", e)
+                self.listener.on_status(f"Pairing: {e}", False)
+                if hasattr(self.listener, "on_pairing"):
+                    self.listener.on_pairing(e.kind)
+                break  # wait for the user to enter the code
             except AdbError as e:
                 reason = "waiting for the USB device" if "not found" in str(e) else str(e)
             except (OSError, EOFError, ProtocolError, _SessionEnded, ValueError) as e:
@@ -213,11 +232,10 @@ class StreamClient:
         ctrl.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with self._lock:
             self._ctrl_sock = ctrl
-        ctrl.sendall(
-            json_packet(
-                PacketType.HELLO, {"client": f"phonecam-pc/{__version__}", "version": 1}
-            ).encode()
-        )
+        hello_req: dict[str, Any] = {"client": f"phonecam-pc/{__version__}", "version": 1}
+        if target.pairing:
+            hello_req["pairing"] = target.pairing
+        ctrl.sendall(json_packet(PacketType.HELLO, hello_req).encode())
         try:
             hello = read_packet(ctrl)
         except (EOFError, ProtocolError) as e:
@@ -225,7 +243,10 @@ class StreamClient:
             raise _SessionEnded("PhoneCam is not streaming on the phone") from e
         if hello.type != PacketType.HELLO:
             raise _SessionEnded(f"expected HELLO, got type {hello.type:#x}")
-        self.listener.on_hello(hello.json())
+        hello_json = hello.json()
+        if hello_json.get("error") in ("pairing_required", "pairing_failed"):
+            raise PairingError(hello_json["error"])
+        self.listener.on_hello(hello_json)
 
         video = socket.create_connection((target.host, target.video_port), timeout=3)
         video.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

@@ -36,6 +36,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -63,10 +64,15 @@ import com.ares.phonecam.camera.Geometry
 import com.ares.phonecam.engine.EngineState
 import com.ares.phonecam.engine.SettingsRepository
 import com.ares.phonecam.engine.StreamEngine
+import com.ares.phonecam.net.LocalAddress
+import com.ares.phonecam.net.NetworkAddresses
 import com.ares.phonecam.net.ServerState
 import com.ares.phonecam.net.StreamServer
 import com.ares.phonecam.service.StreamingService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun MainScreen(engine: StreamEngine, server: StreamServer, settings: SettingsRepository) {
@@ -158,6 +164,12 @@ fun MainScreen(engine: StreamEngine, server: StreamServer, settings: SettingsRep
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        val pairing = if (saved?.requirePairing != false) saved?.pairingCode else null
+        WifiInfo(addresses = rememberAddresses(), pairing = pairing, requirePairing = saved?.requirePairing != false, net = net)
+        LaunchedEffect(saved?.pairingCode == null && saved != null) {
+            if (saved != null && saved?.pairingCode == null) settings.pairingCode() // create one
+        }
+
         state.recordingFile?.let {
             Text("Recording: ${it.name}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -186,8 +198,51 @@ fun MainScreen(engine: StreamEngine, server: StreamServer, settings: SettingsRep
             onKeepScreenOnChange = { on -> scope.launch { settings.setKeepScreenOn(on) } },
             record = record,
             onRecordChange = { record = it },
+            requirePairing = saved?.requirePairing != false,
+            onRequirePairingChange = { on -> scope.launch { settings.setRequirePairing(on) } },
+            pairingCode = saved?.pairingCode,
+            onNewPairingCode = { scope.launch { settings.newPairingCode() } },
             onDismiss = { showSettings = false },
         )
+    }
+}
+
+/** Local addresses, refreshed every few seconds (Wi-Fi changes, hotspot on/off). */
+@Composable
+private fun rememberAddresses(): List<LocalAddress> {
+    var list by remember { mutableStateOf(emptyList<LocalAddress>()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            list = withContext(Dispatchers.IO) { NetworkAddresses.list() }
+            delay(3000)
+        }
+    }
+    return list
+}
+
+@Composable
+private fun WifiInfo(addresses: List<LocalAddress>, pairing: String?, requirePairing: Boolean, net: ServerState) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(10.dp),
+    ) {
+        if (addresses.isEmpty()) {
+            Text("Wi-Fi: not connected (USB works without it)", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            addresses.take(2).forEach { a ->
+                Text("${a.kind}: ${a.ip}", style = MaterialTheme.typography.titleMedium, fontFamily = FontFamily.Monospace)
+            }
+            Text(
+                if (requirePairing) "Pairing code: ${pairing ?: "…"}   ·   ports 47100/47101"
+                else "No pairing code (anyone on this network can connect)   ·   ports 47100/47101",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (requirePairing) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+            )
+        }
+        net.rejected?.let {
+            Text("Rejected a connection from $it (wrong or missing code)", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error)
+        }
     }
 }
 

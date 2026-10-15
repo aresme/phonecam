@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -19,12 +20,15 @@ import com.ares.phonecam.MainActivity
 import com.ares.phonecam.PhoneCamApp
 import com.ares.phonecam.R
 import com.ares.phonecam.TAG
+import com.ares.phonecam.net.Discovery
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 /**
@@ -37,6 +41,10 @@ class StreamingService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var watcher: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var pairingJob: Job? = null
+    private val discovery by lazy { Discovery(this) }
+    private val settings get() = (application as PhoneCamApp).settings
     private val engine get() = (application as PhoneCamApp).engine
     private val server get() = (application as PhoneCamApp).server
 
@@ -55,8 +63,26 @@ class StreamingService : Service() {
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PhoneCam:streaming")
                 .apply { acquire() }
         }
+        if (wifiLock == null) {
+            // Keep Wi-Fi out of power-save while streaming (power save adds 100+ ms bursts).
+            @Suppress("DEPRECATION")
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifiLock = applicationContext.getSystemService(WifiManager::class.java)
+                .createWifiLock(mode, "PhoneCam:streaming").apply { setReferenceCounted(false); acquire() }
+        }
         engine.startStreaming(record = intent?.getBooleanExtra(EXTRA_RECORD, false) ?: false)
-        server.start()
+        if (pairingJob == null) {
+            // (Re)start the server whenever the pairing setting or code changes.
+            pairingJob = scope.launch {
+                settings.settings.map { it.requirePairing to it.pairingCode }.distinctUntilChanged().collect { (required, _) ->
+                    val code = if (required) settings.pairingCode() else null
+                    server.start(code)
+                    discovery.unregister()
+                    discovery.register(pairingRequired = code != null)
+                }
+            }
+        }
         if (watcher == null) {
             // Stop ourselves when streaming ends for any reason (UI, error, give-up).
             watcher = scope.launch {
@@ -71,7 +97,10 @@ class StreamingService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        discovery.unregister()
         server.stop()
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
         engine.stopStreaming()
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null

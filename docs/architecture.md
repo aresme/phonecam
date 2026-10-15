@@ -69,6 +69,21 @@ Tap-to-focus maps a normalized point in the displayed or streamed frame back to 
 The default crop is a centered region with the stream's aspect ratio (`camera/Geometry.kt`,
 unit tested).
 
+### Wi-Fi
+
+While streaming the phone holds a `WIFI_MODE_FULL_LOW_LATENCY` Wi-Fi lock (API 29+; HIGH_PERF
+before) so that Wi-Fi power save doesn't add 100+ ms bursts, registers `_phonecam._tcp` with
+`NsdManager`, and enforces the pairing code for non-loopback clients (`StreamServer`). The PC
+browses with python-zeroconf (`discovery.py`) and lists phones above recent IPs.
+
+### Camera taken by another app
+
+If another app (e.g. the stock camera) takes the camera, the engine keeps the service, server and
+PC connection alive, shows "Camera in use by another app — waiting", retries with backoff (max
+5 s, never giving up) and immediately when `CameraManager.AvailabilityCallback` reports the camera
+free again. Camera open and session configuration are bounded by 5 s timeouts, so a lost callback
+can't wedge the reconciler.
+
 ### Drop policy
 
 `encoder → queue(2) → socket`. When the queue is full, a non-key frame is dropped and a sync

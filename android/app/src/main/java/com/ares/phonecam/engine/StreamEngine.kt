@@ -43,6 +43,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -391,6 +392,7 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
     // ------------------------------------------------------------------ reconciliation
 
     private suspend fun loadCameras() {
+        cameraManager.registerAvailabilityCallback(availabilityCallback, handler)
         val encoders = EncoderSelector.all()
         val cams = CameraCatalog.query(cameraManager).map { cam ->
             // Only offer sizes that some H.264 encoder can also handle at the camera's fps.
@@ -455,6 +457,7 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
         val params = captureParams(info, cfg, d.controls, d.streaming).copy(tuning = d.tuning)
 
         if (encoderChange || previewChange || cameraChange || camera.device == null) {
+            Log.d(TAG, "apply: rebuild (encoder=$encoderChange preview=$previewChange camera=$cameraChange open=${camera.device != null})")
             camera.closeSession()
             if (cameraChange) camera.close()
             if (encoderChange) {
@@ -463,8 +466,16 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
                 if (d.streaming) startEncoder(encCfg)
             }
             if (previewChange) swapPreview(d.preview, wantPreviewSize)
-            if (camera.device == null) camera.open(cfg.cameraId)
-            camera.startSession(listOfNotNull(encoder?.inputSurface, previewSurface), params)
+            if (camera.device == null) {
+                Log.d(TAG, "apply: opening camera ${cfg.cameraId}")
+                // Bounded: a pending open whose callback never comes would block the engine forever.
+                withTimeoutOrNull(5000) { camera.open(cfg.cameraId) }
+                    ?: throw java.io.IOException("camera ${cfg.cameraId} open timed out")
+            }
+            Log.d(TAG, "apply: starting session")
+            withTimeoutOrNull(5000) { camera.startSession(listOfNotNull(encoder?.inputSurface, previewSurface), params) }
+                ?: throw java.io.IOException("capture session configuration timed out")
+            Log.d(TAG, "apply: session running")
             if (d.controls.afMode == "locked") appliedFocusSeq = -1 // re-run the scan on the new session
         } else {
             camera.applyParams(params)
@@ -566,22 +577,41 @@ class StreamEngine(context: Context, private val settings: SettingsRepository) {
         swapPreview(null, null)
     }
 
+    private var retryJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Retry with backoff (0.5 s → 5 s) and never give up while streaming is wanted: typically
+     * another app (e.g. the stock camera) took the camera, and we resume when it is released —
+     * immediately via [availabilityCallback], or at the latest on the next 5 s retry. The PC
+     * keeps its connection and shows the last frame / placeholder meanwhile.
+     */
     private suspend fun handleFailure(e: Exception) {
-        Log.e(TAG, "pipeline failure", e)
+        Log.e(TAG, "pipeline failure #${failures + 1}: ${e.message}", if (failures == 0) e else null)
         failures++
         teardown()
-        _state.update { it.copy(error = e.message ?: e.javaClass.simpleName) }
+        val inUse = e.message?.let { "error 1" in it || "error 2" in it || "disconnected" in it } == true
+        _state.update {
+            it.copy(error = if (inUse) "Camera in use by another app — waiting for it" else e.message ?: e.javaClass.simpleName)
+        }
         val d = desired.value
         if (!d.streaming && d.preview == null) return
-        if (failures > 5) {
-            Log.e(TAG, "giving up after $failures failures")
-            desired.update { it.copy(streaming = false, record = false) }
-            return
-        }
-        val backoff = min(500L shl (failures - 1), 5000L)
-        scope.launch {
+        val backoff = min(500L shl (failures - 1).coerceAtMost(4), 5000L)
+        retryJob?.cancel()
+        retryJob = scope.launch {
             delay(backoff)
             desired.update { it.copy(epoch = it.epoch + 1) }
+        }
+    }
+
+    private val availabilityCallback = object : CameraManager.AvailabilityCallback() {
+        override fun onCameraAvailable(cameraId: String) {
+            Log.d(TAG, "camera $cameraId available (failures=$failures)")
+            // Another app released "our" camera while we were waiting for it: retry now.
+            if (failures > 0 && cameraId == desired.value.config?.cameraId) {
+                Log.i(TAG, "camera $cameraId available again; retrying")
+                retryJob?.cancel()
+                desired.update { it.copy(epoch = it.epoch + 1) }
+            }
         }
     }
 

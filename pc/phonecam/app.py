@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QPushButton,
@@ -36,6 +36,7 @@ from phonecam.client import Stats, StreamClient, Target
 from phonecam.controls import ControlsPanel
 from phonecam.decoder import vaapi_available
 from phonecam.desktop import icon_path
+from phonecam.discovery import PhoneBrowser
 from phonecam.latency_test import LatencyWindow
 from phonecam.output import VirtualCamera
 from phonecam.power import PerformanceHold
@@ -109,7 +110,12 @@ class Bridge(QObject):
     state = Signal(dict)
     stats = Signal(object)
     devices = Signal(list)
+    phones = Signal(list)
+    pairing = Signal(str)
     error = Signal(str)
+
+    def on_pairing(self, kind: str) -> None:
+        self.pairing.emit(kind)
 
     def on_status(self, status: str, connected: bool) -> None:
         self.status.emit(status, connected)
@@ -216,6 +222,10 @@ class MainWindow(QMainWindow):
         self.controls.mirror_changed.connect(self._on_mirror)
         self.bridge.state.connect(self.controls.set_state)
         self.preview.clicked.connect(self._on_preview_clicked)
+        self.bridge.phones.connect(self._on_phones)
+        self.bridge.pairing.connect(self._on_pairing)
+        self.browser = PhoneBrowser(self.bridge.phones.emit)
+        run_bg(self.browser.start, "mdns")
         self._restore_settings()
         QTimer.singleShot(0, self._init_vcam)
         if self._autoconnect_pending and self.wifi_radio.isChecked():
@@ -239,10 +249,17 @@ class MainWindow(QMainWindow):
         self.device_combo = QComboBox()
         self.device_combo.setPlaceholderText("No adb device")
         lay.addWidget(self.device_combo)
-        self.ip_edit = QLineEdit(placeholderText="Phone IP, e.g. 192.168.1.20")
-        self.ip_edit.setVisible(False)
-        self.ip_edit.returnPressed.connect(self._toggle_connect)
-        lay.addWidget(self.ip_edit)
+        # Wi-Fi: phones found via mDNS first, then recent IPs; any address can be typed.
+        self.ip_combo = QComboBox()
+        self.ip_combo.setEditable(True)
+        self.ip_combo.lineEdit().setPlaceholderText("Phone IP, e.g. 192.168.1.20")
+        self.ip_combo.setVisible(False)
+        self.ip_combo.lineEdit().returnPressed.connect(self._toggle_connect)
+        lay.addWidget(self.ip_combo)
+        self.discovery_label = QLabel("", objectName="muted")
+        self.discovery_label.setWordWrap(True)
+        self.discovery_label.setVisible(False)
+        lay.addWidget(self.discovery_label)
         self.wifi_radio.toggled.connect(self._on_transport_toggled)
         self.connect_btn = QPushButton("Connect", objectName="primary")
         self.connect_btn.clicked.connect(self._toggle_connect)
@@ -435,7 +452,10 @@ class MainWindow(QMainWindow):
         st = self.settings
         if st.value("conn/transport", "usb") == "wifi" or self.adb is None:
             self.wifi_radio.setChecked(True)
-        self.ip_edit.setText(st.value("conn/ip", "", str))
+        self._recent_ips = [ip for ip in (st.value("conn/recent_ips", [], list) or []) if ip]
+        self._phones: list = []
+        self._fill_ip_combo()
+        self.ip_combo.setEditText(st.value("conn/ip", "", str))
         size = st.value("vcam/size", None)
         if size:
             idx = self.vcam_size.findData(f"{int(size[0])}x{int(size[1])}")
@@ -453,7 +473,8 @@ class MainWindow(QMainWindow):
 
     def _on_transport_toggled(self, wifi: bool) -> None:
         self.device_combo.setVisible(not wifi)
-        self.ip_edit.setVisible(wifi)
+        self.ip_combo.setVisible(wifi)
+        self.discovery_label.setVisible(wifi)
         self.launch_btn.setVisible(not wifi)
 
     def _selected_serial(self) -> str | None:
@@ -468,11 +489,12 @@ class MainWindow(QMainWindow):
             run_bg(self.client.disconnect, "disconnect")
             return
         if self.wifi_radio.isChecked():
-            host = self.ip_edit.text().strip()
+            host = self._wifi_host()
             if not host:
                 self.conn_status.setText("Enter the phone's IP address.")
                 return
-            target = Target(host)
+            code = self.settings.value(f"pairing/{host}", "", str) or None
+            target = Target(host, pairing=code)
         else:
             serial = self._selected_serial()
             if serial is None:
@@ -480,7 +502,8 @@ class MainWindow(QMainWindow):
                 return
             target = Target("127.0.0.1", serial)
         self.settings.setValue("conn/transport", "wifi" if self.wifi_radio.isChecked() else "usb")
-        self.settings.setValue("conn/ip", self.ip_edit.text().strip())
+        self.settings.setValue("conn/ip", self._wifi_host() if self.wifi_radio.isChecked() else "")
+        self._last_target = target
         self.settings.setValue("conn/serial", target.serial or "")
         self._active = True
         self._set_inputs_enabled(False)
@@ -490,6 +513,64 @@ class MainWindow(QMainWindow):
         self.preview.clear("Connecting…")
         run_bg(lambda: self.client.connect(target), "connect")
         self._update_tray()
+
+    # ------------------------------------------------------------------ Wi-Fi
+
+    def _wifi_host(self) -> str:
+        text = self.ip_combo.currentText().strip()
+        idx = self.ip_combo.findText(text)
+        data = self.ip_combo.itemData(idx) if idx >= 0 else None
+        return str(data) if data else text
+
+    def _fill_ip_combo(self) -> None:
+        text = self.ip_combo.currentText()
+        self.ip_combo.blockSignals(True)
+        self.ip_combo.clear()
+        for ph in self._phones:
+            self.ip_combo.addItem(f"📱 {ph.label}", ph.host)
+        known = {ph.host for ph in self._phones}
+        for ip in self._recent_ips:
+            if ip not in known:
+                self.ip_combo.addItem(ip, ip)
+        self.ip_combo.setEditText(text)
+        self.ip_combo.blockSignals(False)
+
+    def _on_phones(self, phones: list) -> None:
+        self._phones = phones
+        self._fill_ip_combo()
+        if phones:
+            self.discovery_label.setText(f"Found {len(phones)} phone(s) on the network.")
+        else:
+            self.discovery_label.setText("Searching the network for phones running PhoneCam…")
+        if phones and not self.ip_combo.currentText().strip():
+            self.ip_combo.setCurrentIndex(0)
+
+    def _remember_ip(self, host: str) -> None:
+        self._recent_ips = [host, *[ip for ip in self._recent_ips if ip != host][:5]]
+        self.settings.setValue("conn/recent_ips", self._recent_ips)
+        self._fill_ip_combo()
+
+    def _on_pairing(self, kind: str) -> None:
+        target = getattr(self, "_last_target", None)
+        if target is None:
+            return
+        msg = (
+            "Enter the pairing code shown on the phone (under its Wi-Fi address):"
+            if kind == "pairing_required"
+            else "Wrong code. Enter the pairing code shown on the phone:"
+        )
+        code, ok = QInputDialog.getText(self, "Pair with phone", msg)
+        code = code.strip()
+        if not ok or not code:
+            self.conn_status.setText("Not connected: pairing code needed.")
+            run_bg(self.client.disconnect, "disconnect")
+            return
+        self.settings.setValue(f"pairing/{target.host}", code)
+        new_target = Target(
+            target.host, target.serial, target.video_port, target.control_port, pairing=code
+        )
+        self._last_target = new_target
+        run_bg(lambda: self.client.connect(new_target), "connect")
 
     def _launch_on_phone(self) -> None:
         serial = self._selected_serial()
@@ -507,7 +588,7 @@ class MainWindow(QMainWindow):
         run_bg(launch, "launch")
 
     def _set_inputs_enabled(self, enabled: bool) -> None:
-        for w in (self.usb_radio, self.wifi_radio, self.device_combo, self.ip_edit):
+        for w in (self.usb_radio, self.wifi_radio, self.device_combo, self.ip_combo):
             w.setEnabled(enabled)
         if self.adb is None:
             self.usb_radio.setEnabled(False)
@@ -527,6 +608,9 @@ class MainWindow(QMainWindow):
         self.conn_status.setText(status)
         self.statusBar().showMessage(status)
         self.controls.set_connected(connected)
+        target = getattr(self, "_last_target", None)
+        if connected and target is not None and target.serial is None:
+            self._remember_ip(target.host)
         self._update_tray()
         self._update_power()
         if connected:
@@ -699,6 +783,7 @@ class MainWindow(QMainWindow):
             return
         if self.tray is not None:
             self.tray.hide()
+        self.browser.stop()
         self.vcam_timer.stop()
         self.power.release()
         if self.adb_monitor:
